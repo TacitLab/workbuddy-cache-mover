@@ -15,9 +15,12 @@ WorkBuddy 缓存目录迁移工具（workbuddy-cache-mover）
                                       → 改名备份+建软链接 → 自动重开 WorkBuddy
   detect                              查看 ~/.workbuddy 状态/体积分布/磁盘空间
   make-runner [--dest-base <dir>]     生成可双击运行的独立脚本（默认一键 migrate 模式）
-  rollback --plan <plan.json>         仅回滚：移除软链接，恢复原目录（保留目标副本）
+  rollback --plan <plan.json>         仅回滚：当前数据迁回原位（含迁移期间变更），
+                                      保留旧快照与 plan
   cleanup-backup --plan <plan.json>   迁移稳定后删除历史备份（默认移入废纸篓）
-  restore --plan <plan.json>          彻底恢复原状：回滚+删目标副本+清理全部痕迹
+  restore --plan <plan.json>          彻底恢复原状：当前数据迁回原位+清旧快照+清痕迹
+                                      （恢复数据源=软链接指向的当前实际位置，绝不用
+                                      旧快照，迁移期间的变更零丢失）
   copy / swap                         旧版两阶段分步模式（不推荐：在线复制会遇到
                                       文件锁与文件持续变化的问题，仅保留作兼容）
 
@@ -643,22 +646,22 @@ def cmd_migrate(args):
                 "migrate 会自动关闭 WorkBuddy，不能在 WorkBuddy 会话内直接运行。\n"
                 "请使用 make-runner 生成的脚本，或在终端中运行本命令。" % procs)
         if state == "running":
-            print("[1/5] 检测到 WorkBuddy 运行中，自动优雅退出 ...")
+            print("[1/6] 检测到 WorkBuddy 运行中，自动优雅退出 ...")
             relaunch = graceful_quit_all(procs)
             state2, _ = detect_app_running()
             if state2 != "not-running":
                 sys.exit("自动退出 WorkBuddy 失败，请手动退出后重新运行。")
             print("      已全部退出，源目录静止。")
         else:
-            print("[1/5] WorkBuddy 未在运行。")
+            print("[1/6] WorkBuddy 未在运行。")
     else:
-        print("[1/5] 跳过 WorkBuddy 进程管理（非默认目录或 --skip-app-handling）。")
+        print("[1/6] 跳过 WorkBuddy 进程管理（非默认目录或 --skip-app-handling）。")
 
-    print("[2/5] 复制 %s (%s, %d 个文件)" % (src, fmt_bytes(src_bytes), src_files))
+    print("[2/6] 复制 %s (%s, %d 个文件)" % (src, fmt_bytes(src_bytes), src_files))
     print("      -> %s （源目录已静止，单遍复制，视磁盘速度可能需要数分钟）" % dest)
     method = run_copy(src, dest)
     print("      复制完成（%s）。" % method)
-    print("[3/5] 严格校验（文件清单与大小逐项比对）...")
+    print("[3/6] 严格校验（文件清单与大小逐项比对）...")
     if not verify_strict(src, dest):
         sys.exit("校验失败。未对源目录做任何改动（原样保留），请排查后重新运行 migrate。")
     # TOCTOU 加固：校验期间用户可能重新打开了 WorkBuddy。
@@ -680,7 +683,7 @@ def cmd_migrate(args):
     backup = src + BACKUP_SUFFIX
     if os.path.exists(backup):
         sys.exit("备份路径已存在，请先处理: " + backup)
-    print("[4/5] 原目录改名备份并创建软链接 ...")
+    print("[4/6] 原目录改名备份并创建软链接 ...")
     try:
         os.rename(src, backup)
     except OSError as ex:
@@ -712,20 +715,33 @@ def cmd_migrate(args):
         "swapped_at": now_iso(),
     }
     path = write_plan(plan)
+    print("[5/6] 迁移成功，清理原始数据（移入废纸篓，可反悔）...")
+    if args.keep_backup:
+        print("      按要求保留原始数据: %s" % backup)
+    else:
+        try:
+            msg = trash_path(backup)
+            plan.update(backup_removed=True, backup_removed_at=now_iso(), backup_removed_how=msg)
+            save_plan(plan)
+            print("      " + msg)
+        except RuntimeError as ex:
+            print("      自动清理失败（%s），原始数据保留在 %s，可稍后用 cleanup-backup 清理。" % (ex, backup))
     if manage_apps and relaunch and not args.no_relaunch:
-        print("[5/5] 重新启动 WorkBuddy ...")
+        print("[6/6] 重新启动 WorkBuddy ...")
         relaunch_apps(relaunch)
     else:
-        print("[5/5] 跳过自动重启（--no-relaunch 或此前未关闭应用）。")
+        print("[6/6] 跳过自动重启（--no-relaunch 或此前未关闭应用）。")
     print()
     print("✓ 一键迁移完成！")
     print("  %s 现为软链接 -> %s" % (src, dest))
-    print("  旧数据保留在备份: %s" % backup)
     print("  plan: %s" % path)
-    print("  确认应用稳定运行数日后，可让助手执行清理备份:")
-    print("    python3 %s cleanup-backup --plan %s --yes" % (os.path.abspath(__file__), path))
-    print("  如需回滚（保留迁移副本）: python3 %s rollback --plan %s" % (os.path.abspath(__file__), path))
-    print("  如需彻底恢复原状: python3 %s restore --plan %s" % (os.path.abspath(__file__), path))
+    print("  后续所有操作（回滚/恢复）都基于当前实际数据位置 %s，与备份无关。" % dest)
+    if not args.keep_backup:
+        print("  如需反悔删除: 可从系统废纸篓找回原始数据。")
+    else:
+        print("  原始数据保留在: %s（确认稳定后用 cleanup-backup 清理）" % backup)
+    print("  回滚（数据迁回原位，零丢失）: python3 %s rollback --plan %s" % (os.path.abspath(__file__), path))
+    print("  彻底恢复原状: python3 %s restore --plan %s" % (os.path.abspath(__file__), path))
 
 
 def require_offline(args):
@@ -876,25 +892,82 @@ def cmd_make_runner(args):
         print("  3) 看到完成提示后，重新打开 WorkBuddy")
 
 
+def _rmdir_if_empty(path):
+    """空目录则删除（非递归，目录非空时静默保留）。"""
+    try:
+        os.rmdir(path)
+        return True
+    except OSError:
+        return False
+
+
+def move_dest_back(src, dest):
+    """把当前缓存数据（实际位置 dest，含迁移期间全部变更）迁回默认路径 src。
+    恢复的数据源永远是 dest——软链接的当前指向，绝不使用 backup 旧快照，
+    否则迁移期间的变更会全部丢失。
+    同卷: rename 瞬间完成（dest 路径消失）；
+    跨卷: 复制 + 严格校验（失败自动恢复软链接，数据无损），dest 保留由用户确认后删除。
+    返回 (mode, message)。"""
+    parent = os.path.dirname(src)
+    os.makedirs(parent, exist_ok=True)
+    try:
+        same_vol = os.stat(parent).st_dev == os.stat(dest).st_dev
+    except OSError:
+        same_vol = False
+    if same_vol:
+        try:
+            os.rename(dest, src)
+            if os.path.isdir(src):
+                _rmdir_if_empty(os.path.dirname(dest))  # 顺手清理空的基准目录
+                return "rename", "同卷瞬时移动完成。"
+        except OSError:
+            pass
+    run_copy(dest, src)
+    if not verify_strict(dest, src):
+        shutil.rmtree(src, ignore_errors=True)
+        make_link(dest, src)
+        raise RuntimeError(
+            "跨卷复制校验失败。已自动恢复软链接，数据无损仍在 %s；请检查目标磁盘后重试。" % dest)
+    # 复制校验一致，src 已是最新数据；dest 是多余副本，移入废纸篓（可反悔）
+    note = "跨卷复制完成并校验一致。"
+    try:
+        msg = trash_path(dest)
+        _rmdir_if_empty(os.path.dirname(dest))  # 顺手清理空的基准目录
+        note += "旧副本%s。" % msg
+    except RuntimeError as ex:
+        note += "旧副本仍在 %s（%s），确认数据正常后可自行删除。" % (dest, ex)
+    return "copy", note
+
+
 def cmd_rollback(args):
+    """仅回滚：把当前缓存数据放回默认路径，保留旧快照与 plan（便于再次迁移）。
+    数据源 = 软链接指向的当前实际位置（含迁移期间全部变更），不用备份快照，零丢失。"""
     plan = load_plan(args.plan)
-    src, backup, dest = plan["src"], plan["backup"], plan["dest"]
-    if link_target(src) is None:
-        sys.exit("源路径不是软链接，无需回滚: " + src)
-    if not os.path.isdir(backup):
-        sys.exit("备份不存在: %s\n数据仍完整保留在迁移目标位置 %s，请人工处理。" % (backup, dest))
+    src, dest, backup = plan["src"], plan["dest"], plan["backup"]
+    cur = link_target(src)
+    if cur is None and os.path.isdir(src):
+        print("源路径已是真实目录，无需回滚: " + src)
+        return
+    if cur is None:
+        sys.exit("源路径不是软链接: %s，请人工检查。" % src)
+    if os.path.normpath(os.path.abspath(cur)) != os.path.normpath(os.path.abspath(dest)):
+        sys.exit("软链接指向 %s 与 plan 目标 %s 不符，请人工检查。" % (cur, dest))
     require_offline(args)
-    print("[1/2] 移除软链接: %s" % src)
+    print("[1/3] 移除软链接: %s" % src)
     remove_link(src)
     if os.path.lexists(src):
         sys.exit("移除软链接失败，原样保留，请人工检查。")
-    print("[2/2] 恢复备份: %s -> %s" % (backup, src))
-    os.rename(backup, src)
+    print("[2/3] 当前缓存数据迁回默认路径（数据源=当前实际位置，含迁移期间全部变更）...")
+    mode, msg = move_dest_back(src, dest)
     plan.update(swapped=False, rolled_back_at=now_iso())
     save_plan(plan)
+    print("[3/3] 完成。")
     print()
-    print("✓ 已回滚，%s 恢复为真实目录。" % src)
-    print("  迁移出去的数据仍在 %s，确认不需要后可手动删除。" % dest)
+    print("✓ 已回滚，%s 恢复为真实目录（迁移期间全部变更保留，无数据丢失）。" % src)
+    if mode == "copy":
+        print("  " + msg)
+    if os.path.isdir(backup):
+        print("  迁移时刻的旧快照仍在: %s（确认后可删除，或让助手用 cleanup-backup 清理）" % backup)
 
 
 def cmd_cleanup_backup(args):
@@ -906,18 +979,30 @@ def cmd_cleanup_backup(args):
         print("备份此前已删除(%s)，无需重复操作。" % plan.get("backup_removed_at", ""))
         return
     cur = link_target(src)
-    if cur is None or os.path.normpath(os.path.abspath(cur)) != os.path.normpath(os.path.abspath(dest)):
-        sys.exit(
-            "当前源路径不是指向迁移目标的软链接，状态与 plan 不符，拒绝删除备份。\n"
-            "  src=%s\n  当前链接目标=%s\n  plan 目标=%s" % (src, cur, dest))
-    if not os.path.isdir(backup):
-        print("备份目录不存在（可能已手动删除）: %s" % backup)
-        plan.update(backup_removed=True, backup_removed_at=now_iso())
-        save_plan(plan)
-        return
-    b_bytes, b_files, _ = tree_stats(backup)
-    print("待清理的迁移备份: %s (%s, %d 个文件)" % (backup, fmt_bytes(b_bytes), b_files))
-    print("删除后 rollback/restore 将不可用（数据仍在迁移目标 %s）。" % dest)
+    if cur is not None:
+        if os.path.normpath(os.path.abspath(cur)) != os.path.normpath(os.path.abspath(dest)):
+            sys.exit(
+                "当前源路径是指向别处的软链接，状态与 plan 不符，拒绝删除备份。\n"
+                "  src=%s\n  当前链接目标=%s\n  plan 目标=%s" % (src, cur, dest))
+        if not os.path.isdir(backup):
+            print("备份目录不存在（可能已手动删除）: %s" % backup)
+            plan.update(backup_removed=True, backup_removed_at=now_iso())
+            save_plan(plan)
+            return
+        b_bytes, b_files, _ = tree_stats(backup)
+        print("待清理的迁移备份: %s (%s, %d 个文件)" % (backup, fmt_bytes(b_bytes), b_files))
+        print("说明: 删除的是迁移时刻的旧快照，当前数据在迁移目标 %s，不受影响。" % dest)
+    elif os.path.isdir(src):
+        if not os.path.isdir(backup):
+            print("备份目录不存在（可能已手动删除）: %s" % backup)
+            plan.update(backup_removed=True, backup_removed_at=now_iso())
+            save_plan(plan)
+            return
+        b_bytes, b_files, _ = tree_stats(backup)
+        print("待清理的迁移备份: %s (%s, %d 个文件)" % (backup, fmt_bytes(b_bytes), b_files))
+        print("说明: 当前已回滚，最新数据在原位 %s，删除旧快照完全安全。" % src)
+    else:
+        sys.exit("源路径状态异常（非软链接也非真实目录），拒绝删除备份: " + src)
     if not args.yes:
         sys.exit("未确认。请与用户明确确认后加 --yes 执行。")
     msg = trash_path(backup, hard=args.hard_delete)
@@ -929,40 +1014,38 @@ def cmd_cleanup_backup(args):
 
 def cmd_restore(args):
     """用户主动发起的动作二：彻底恢复原状。
-    移除软链接 → 备份恢复为原目录 → 目标副本移入废纸篓 → 清理 plan/runner 痕迹。
-    与 rollback 的区别：rollback 只恢复原目录、保留目标副本与 plan，便于再次迁移。"""
+    恢复数据源 = 软链接指向的当前实际位置（含迁移期间全部变更），绝不用 backup 旧快照：
+      移除软链接 → 当前数据迁回 ~/.workbuddy → 旧快照进废纸篓 → 清理 plan/runner 痕迹。
+    与 rollback 的区别：rollback 只迁回数据（快照与 plan 保留）；restore 一切回到迁移前。"""
     plan = load_plan(args.plan)
     src, dest, backup = plan["src"], plan["dest"], plan["backup"]
     cur = link_target(src)
+    copy_note = ""
     if cur is None and os.path.isdir(src):
-        print("源路径已是真实目录（此前已回滚），跳过恢复步骤。")
+        print("源路径已是真实目录（此前已回滚），跳过数据迁回。")
     elif cur is None:
         sys.exit("源路径既不是软链接也不是目录: %s，请人工检查。" % src)
     else:
-        if not os.path.isdir(backup):
-            sys.exit(
-                "备份不存在，无法安全恢复原状: %s\n"
-                "当前数据只在迁移目标 %s。若要恢复，请人工把目标目录改名/移动回原路径。" % (backup, dest))
         if os.path.normpath(os.path.abspath(cur)) != os.path.normpath(os.path.abspath(dest)):
             sys.exit("软链接指向 %s 与 plan 目标 %s 不符，请人工检查。" % (cur, dest))
         require_offline(args)
-        print("[1/4] 移除软链接: %s" % src)
+        print("[1/3] 移除软链接: %s" % src)
         remove_link(src)
         if os.path.lexists(src):
             sys.exit("移除软链接失败，原样保留，请人工检查。")
-        print("[2/4] 恢复备份为原目录: %s -> %s" % (backup, src))
-        os.rename(backup, src)
+        print("[2/3] 当前缓存数据迁回默认路径（数据源=当前实际位置，含迁移期间全部变更）...")
+        _mode, copy_note = move_dest_back(src, dest)
         plan.update(swapped=False, restored_at=now_iso())
         save_plan(plan)
-    if args.keep_target:
-        print("[3/4] 按要求保留迁移目标副本: %s" % dest)
-    elif os.path.isdir(dest):
-        print("[3/4] 迁移目标副本移入废纸篓: %s (%s)" % (dest, fmt_bytes(tree_stats(dest)[0])))
-        msg = trash_path(dest, hard=args.hard_delete)
-        print("      " + msg)
-    else:
-        print("[3/4] 迁移目标副本不存在，跳过: %s" % dest)
-    print("[4/4] 清理 plan 与 runner 文件 ...")
+    print("[3/3] 清理迁移产物（旧快照 + plan/runner）...")
+    if os.path.isdir(backup):
+        if args.keep_backup:
+            print("      按要求保留旧快照: %s" % backup)
+        else:
+            msg = trash_path(backup, hard=args.hard_delete)
+            print("      旧快照（迁移时刻的备份）: " + msg)
+    if copy_note.startswith("跨卷"):
+        print("      " + copy_note)
     removed = []
     for f in ("run_migrate.command", "run_migrate.bat", "migrate-args.json",
               "run_swap.command", "run_swap.bat",
@@ -979,7 +1062,7 @@ def cmd_restore(args):
         pass
     print("      已清理: %s" % ("、".join(removed) if removed else "无"))
     print()
-    print("✓ 已恢复原状：%s 为真实目录，迁移副本与痕迹已清理。" % src)
+    print("✓ 已恢复原状：%s 为真实目录，数据为迁移后最新状态（无变更丢失）。" % src)
 
 
 def cmd_status(args):
@@ -1008,6 +1091,8 @@ def main():
     mg.add_argument("--skip-app-handling", action="store_true",
                     help="不自动关闭/重开 WorkBuddy（非默认目录自动生效）")
     mg.add_argument("--no-relaunch", action="store_true", help="迁移完成后不自动重新打开 WorkBuddy")
+    mg.add_argument("--keep-backup", action="store_true",
+                    help="迁移后保留原始数据（默认自动移入废纸篓）")
     mg.set_defaults(func=cmd_migrate)
 
     c = sub.add_parser("copy", help="旧版阶段1：在线复制（不推荐，遇文件锁/文件变化；建议用 migrate）")
@@ -1043,10 +1128,10 @@ def main():
     cb.add_argument("--hard-delete", action="store_true", help="不进废纸篓，永久删除（不建议）")
     cb.set_defaults(func=cmd_cleanup_backup)
 
-    rs = sub.add_parser("restore", help="彻底恢复原状：回滚+删除迁移副本+清理全部痕迹")
+    rs = sub.add_parser("restore", help="彻底恢复原状：当前数据迁回原位+清旧快照+清理全部痕迹")
     rs.add_argument("--plan", required=True, help="plan 文件路径，或 latest")
-    rs.add_argument("--keep-target", action="store_true", help="保留迁移目标副本，仅恢复原目录")
-    rs.add_argument("--hard-delete", action="store_true", help="副本不进废纸篓，永久删除")
+    rs.add_argument("--keep-backup", action="store_true", help="保留迁移时刻的旧快照，仅清理其他产物")
+    rs.add_argument("--hard-delete", action="store_true", help="旧快照不进废纸篓，永久删除")
     rs.add_argument("--allow-app-running", action="store_true")
     rs.set_defaults(func=cmd_restore)
 

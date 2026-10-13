@@ -23,8 +23,10 @@ WorkBuddy 的主数据/缓存目录固定在 `~/.workbuddy`（Windows 为 `%USER
 2. **禁止在 WorkBuddy 会话内直接运行 migrate**（会把自己所在的会话杀掉，脚本可能随会话
    中断）：在会话内只能 detect / make-runner / cleanup-backup / 状态确认；migrate 必须通过
    make-runner 生成的脚本或用户在终端执行。沙箱内进程检测失败会返回 unknown，migrate 同样拒绝。
-3. **原目录从不删除**：migrate 把原目录改名为 `~/.workbuddy.wb-migration-backup` 保留；
-   确认稳定后由用户发起「清理备份」动作删除（进废纸篓）。
+3. **不长期保留备份**：迁移数据经严格校验（两轮+进程复查）一致后，原始数据自动**移入系统
+   废纸篓**（可反悔，--keep-backup 可保留）。后续 rollback/restore 的数据源永远是**软链接
+   指向的当前实际位置**（含迁移后全部变更），绝不使用旧快照——用备份恢复会导致迁移期间
+   的变更全部丢失。
 4. **目标位置必须由用户明确指定**，禁止自行猜测；确认前把最终路径完整展示给用户。
 5. 复制后做**严格校验**（文件清单+大小逐项一致，两轮+进程复查），任何不一致直接中止，
    源目录原样保留；建软链接失败自动恢复原目录。**迁移中途用户打开 WorkBuddy 的任何时点
@@ -62,7 +64,7 @@ Windows `D:\wb-data`）。向用户确认最终路径与预期行为：
 - 源：`~/.workbuddy`（X GB）
 - 目标：`<用户指定基准>/.workbuddy`
 - 过程：脚本会自动关闭 WorkBuddy，迁移完成后自动重新打开
-- 备份：`~/.workbuddy.wb-migration-backup` 保留
+- 迁移完成后：校验通过即把原始数据移入废纸篓（不占双倍空间；如反悔可从废纸篓找回）
 
 用户明确同意后才进入下一步。
 
@@ -88,45 +90,40 @@ plan 文件由 migrate 自动生成在 `~/.wb-cache-move/plan-*.json`（`swapped
 
 ## 用户可主动发起的收尾动作
 
-### 动作一：迁移稳定后清理历史缓存备份（cleanup-backup）
+### 动作一：清理残留的原始数据（cleanup-backup，兜底用）
 
-用户说「迁移完了，把备份删了」「清理历史缓存」时触发。
-
-1. 先跑 `python3 $SCRIPT detect` 确认处于已迁移状态（软链接正常指向目标，应用工作正常）
-2. 用 AskUserQuestion 与用户确认：展示备份路径与体积，说明删除后 rollback/restore 将不可用
-   （数据仍在迁移目标位置，不会丢）
-3. 执行（默认移入系统废纸篓，可反悔）：
+migrate 默认会自动把原始数据移入废纸篓；本命令仅在两种情况用到：migrate 时自动清理失败
+（无废纸篓工具的环境）、或当时用了 `--keep-backup` 事后想清理。
 
 ```bash
 python3 $SCRIPT cleanup-backup --plan <plan路径> --yes
 ```
 
-- 脚本会校验软链接仍指向目标，状态不符直接拒绝
-- `--hard-delete` 为永久删除（不进废纸篓），除非用户明确要求否则不要使用
-- 清理备份**不需要退出 WorkBuddy**（备份目录不在使用中）
+- 默认移入系统废纸篓（可反悔）；`--hard-delete` 永久删除仅在用户明确要求时使用
+- 脚本会校验当前状态（软链接指向 or 已回滚），状态异常直接拒绝
+- 清理**不需要退出 WorkBuddy**
 
 ### 动作二：彻底恢复原状（restore）
 
-用户说「恢复原状」「搬回去」「还原迁移」时触发。与 rollback 的区别：
-rollback 只把原目录恢复（目标副本与 plan 保留，便于再次迁移）；
-**restore 是一切回到迁移前**——数据放回原位 + 迁移副本移入废纸篓 + 清理 plan/runner 痕迹。
+用户说「恢复原状」「搬回去」「还原迁移」时触发。
 
-1. 与用户确认：恢复后目标位置的副本也会被移入废纸篓（`--keep-target` 可保留）
-2. restore 需要移动 `~/.workbuddy`，同样不能在会话内直接跑；生成 restore 版独立脚本：
+**数据源 = 软链接指向的当前实际位置**（含迁移后全部变更），绝不用旧快照：
+移除软链接 → 当前数据迁回 `~/.workbuddy`（同卷 rename 瞬间完成 / 跨卷复制+严格校验，
+失败自动恢复软链接）→ 清理旧快照（如有）与 plan/runner 痕迹 → 一切回到迁移前，
+**迁移期间的变更零丢失**。
+
+1. restore 需要移动 `~/.workbuddy`，不能在会话内直接跑；生成 restore 版独立脚本：
 
 ```bash
 python3 $SCRIPT make-runner --command restore
 ```
 
-3. 用户退出 WorkBuddy → 双击 `~/.wb-cache-move/run_restore.command`（.bat）→ 重开 WorkBuddy
-
-内部顺序：移除软链接 → 备份恢复为 `~/.workbuddy` → 目标副本移入废纸篓 → 清理 plan/runner。
-若备份已被动作一删除，restore 会**拒绝执行**并提示数据只在目标位置，
-此时只能人工把目标目录改名/移动回原路径。
+2. 用户退出 WorkBuddy → 双击 `~/.wb-cache-move/run_restore.command`（.bat）→ 重开 WorkBuddy
 
 ### 仅回滚（rollback，保留迁移能力）
 
-用户说「先退回原来的位置，但目标副本先留着」时使用（同样需退出 WorkBuddy 后执行）：
+用户说「数据搬回原位，但以后可能再迁」时使用（同样需退出 WorkBuddy 后执行）。
+数据源同样是当前实际位置（含迁移后全部变更），同卷 rename / 跨卷复制+校验：
 
 ```bash
 python3 $SCRIPT rollback --plan <plan路径>
@@ -148,4 +145,5 @@ WorkBuddy 运行时复制会遇到文件锁报错、文件持续增长导致副�
 | 严格校验失败（多出/缺失/大小不一致文件） | 目标目录有脏数据或迁移期间有外部写入；脚本中止且源目录原样保留，排查后重跑 |
 | Windows mklink /J 失败 | 目标是网络路径时 junction 不可用，需管理员 `mklink /D` |
 | 想迁移到另一块位置（二次搬迁） | 先 rollback 恢复，再重新一键 migrate 到新位置 |
-| cleanup-backup 后想恢复原状 | 备份已删，脚本拒绝；人工把目标目录改名回 `~/.workbuddy` 即可 |
+| rollback/restore 后数据会回退到迁移时吗 | 不会。数据源是软链接指向的当前实际位置，迁移后的全部变更都保留 |
+| 废纸篓里的原始数据何时清 | 由系统/用户自行管理；迁移稳定后清空废纸篓即可 |
