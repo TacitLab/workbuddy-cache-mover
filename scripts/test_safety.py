@@ -259,6 +259,29 @@ except m.BusyError: sys.exit(4)
         self.migrate()
         self.assertEqual(os.stat(self.dest).st_mode & 0o777, 0o700)
 
+    def test_record_cannot_request_cleanup_of_home_directory(self):
+        plan = self.migrate()
+        plan['old_target'] = os.path.expanduser('~')
+        m.save_plan(plan)
+        with mock.patch.object(m, 'trash_path') as trash:
+            with self.assertRaises(m.SafeAbort):
+                m.cmd_cleanup_backup(self.restore_args())
+            trash.assert_not_called()
+
+    def test_invalid_historical_backup_is_preserved(self):
+        origin = self.migrate()
+        unrelated = os.path.join(self.root, 'unrelated')
+        os.mkdir(unrelated)
+        with open(os.path.join(unrelated, 'personal'), 'w') as f:
+            f.write('keep me')
+        history = dict(origin, backup=unrelated,
+                       source_digest=m.manifest_digest(m.manifest(unrelated, hashes=True)))
+        history['plan_path'] = os.path.join(self.plan_dir, 'plan-zzzz-invalid.json')
+        m.save_plan(history)
+        with mock.patch.object(m, 'trash_path', side_effect=self.fake_trash):
+            m.cmd_restore(self.restore_args(plan=origin['plan_path'], keep_backup=False))
+        self.assertTrue(os.path.isfile(os.path.join(unrelated, 'personal')))
+
     def test_cleanup_failure_is_completed_with_warnings(self):
         with mock.patch.object(m, 'trash_path', side_effect=OSError('trash denied')):
             rc = m.execute_logged(lambda: m.cmd_migrate(self.migrate_args(keep_backup=False)), os.path.join(self.root, 'logs'))

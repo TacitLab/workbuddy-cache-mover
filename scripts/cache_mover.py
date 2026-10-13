@@ -614,6 +614,12 @@ def guard_common(src):
 
 def validate_plan(plan, args):
     resolve_src(plan['src'], getattr(args, 'force_any_dir', False))
+    for key in ('dest', 'data', 'old_target'):
+        path = plan.get(key)
+        if path:
+            if not isinstance(path, str) or not os.path.isabs(path):
+                raise SafeAbort('记录中的数据位置无效: ' + key)
+            guard_common(path)
     backup = plan['backup']
     if backup != plan['src'] + BACKUP_SUFFIX and not re.fullmatch(re.escape(plan['src'] + BACKUP_SUFFIX) + '-[0-9a-f]{32}', backup):
         raise SafeAbort('备份路径与原目录不符，拒绝清理。')
@@ -982,6 +988,11 @@ def restore_data(args, full):
             for filename in sorted(glob.glob(os.path.join(PLAN_DIR, 'plan-*.json'))):
                 history = load_plan(filename)
                 if history.get('action') == 'migrate' and os.path.normcase(history['src']) == os.path.normcase(src):
+                    try:
+                        validate_plan(history, args)
+                    except SafeAbort as ex:
+                        warn('历史记录路径无效，跳过该记录的副本清理: ' + str(ex))
+                        continue
                     for path in (history['backup'], history.get('old_target')):
                         if path and os.path.isdir(path) and not same_path(path, src):
                             snapshots[path] = history.get('source_digest')
