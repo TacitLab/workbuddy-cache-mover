@@ -661,11 +661,32 @@ def cmd_migrate(args):
     print("[3/5] 严格校验（文件清单与大小逐项比对）...")
     if not verify_strict(src, dest):
         sys.exit("校验失败。未对源目录做任何改动（原样保留），请排查后重新运行 migrate。")
+    # TOCTOU 加固：校验期间用户可能重新打开了 WorkBuddy。
+    # 1) 进程复查：一旦发现运行立即中止（源目录未动）；
+    # 2) 二轮校验：即使进程检测漏网（如检测为 unknown 的场景），源目录若在校验
+    #    期间发生任何变化（新文件/大小变化），二轮比对必然暴露，同样中止。
+    if manage_apps:
+        st, _info = detect_app_running()
+        if st != "not-running":
+            sys.exit(
+                "检测到 WorkBuddy 在迁移过程中被重新打开，已中止。\n"
+                "源目录未做任何改动（副本已在目标位置，可安全重跑）。\n"
+                "请保持 WorkBuddy 退出状态，重新运行本脚本。")
+    print("      复查源目录状态（二轮校验，防迁移期间外部写入）...")
+    if not verify_strict(src, dest):
+        sys.exit(
+            "二轮校验发现源目录在迁移期间发生了变化（可能有程序在写入），已中止。\n"
+            "源目录未做任何改动，请确保 WorkBuddy 保持完全退出后重新运行。")
     backup = src + BACKUP_SUFFIX
     if os.path.exists(backup):
         sys.exit("备份路径已存在，请先处理: " + backup)
     print("[4/5] 原目录改名备份并创建软链接 ...")
-    os.rename(src, backup)
+    try:
+        os.rename(src, backup)
+    except OSError as ex:
+        sys.exit(
+            "改名备份失败（WorkBuddy 可能刚被打开并锁定了目录）: %s\n"
+            "源目录未做任何改动，请完全退出 WorkBuddy 后重新运行本脚本。" % ex)
     try:
         make_link(dest, src)
     except Exception as ex:
