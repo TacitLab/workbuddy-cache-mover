@@ -11,13 +11,15 @@ WorkBuddy 缓存目录迁移工具（workbuddy-cache-mover）
 ~/Library/Application Support 等 Electron 缓存/用户数据一律不碰。
 
 子命令:
+  migrate  --dest-base <dir>          一键迁移（推荐）：自动关闭 WorkBuddy → 复制 → 校验
+                                      → 改名备份+建软链接 → 自动重开 WorkBuddy
   detect                              查看 ~/.workbuddy 状态/体积分布/磁盘空间
-  copy    --dest-base <dir>           阶段1（在线安全）：复制数据到目标并校验
-  swap    --plan <plan.json>          阶段2（须退出 WorkBuddy）：改名备份+建软链接
-  make-runner --plan <plan.json>      生成退出 WorkBuddy 后可双击运行的独立脚本
+  make-runner [--dest-base <dir>]     生成可双击运行的独立脚本（默认一键 migrate 模式）
   rollback --plan <plan.json>         仅回滚：移除软链接，恢复原目录（保留目标副本）
   cleanup-backup --plan <plan.json>   迁移稳定后删除历史备份（默认移入废纸篓）
   restore --plan <plan.json>          彻底恢复原状：回滚+删目标副本+清理全部痕迹
+  copy / swap                         旧版两阶段分步模式（不推荐：在线复制会遇到
+                                      文件锁与文件持续变化的问题，仅保留作兼容）
 
 仅使用标准库，无第三方依赖。Python >= 3.8。
 """
@@ -30,6 +32,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import stat as statmod
 import subprocess
 import sys
@@ -242,6 +245,100 @@ def detect_app_running():
     return ("running" if hits else "not-running"), hits
 
 
+# ---------------------------------------------------------------- 应用生命周期（migrate 用）
+
+def mac_app_bundles(procs):
+    """从进程列表提取 .app bundle 路径（去重，主程序在前）。"""
+    bundles = []
+    for _pid, comm in procs:
+        m = re.match(r"^(.*?\.app)/Contents/MacOS/", comm)
+        if m and m.group(1) not in bundles:
+            bundles.append(m.group(1))
+    return bundles
+
+
+def windows_main_exes():
+    """记录当前运行的 WorkBuddy 主程序 exe 路径（Windows，用于迁移后重开）。"""
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "Get-Process | Where-Object { $_.Path -match 'workbuddy' } | "
+             "Select-Object -ExpandProperty Path -Unique"],
+            capture_output=True, text=True, errors="replace")
+        return [line.strip() for line in (r.stdout or "").splitlines()
+                if line.strip() and line.strip().lower().endswith(".exe")]
+    except Exception:
+        return []
+
+
+def wait_apps_gone(timeout):
+    for _ in range(timeout):
+        time.sleep(1)
+        state, _ = detect_app_running()
+        if state == "not-running":
+            return True
+    return False
+
+
+def kill_running(sig):
+    state, procs = detect_app_running()
+    if state != "running":
+        return
+    for pid, _comm in procs:
+        try:
+            os.kill(int(pid), sig)
+        except (ProcessLookupError, PermissionError, ValueError, OSError):
+            pass
+
+
+def graceful_quit_all(procs):
+    """自动退出所有 WorkBuddy/CodeBuddy 进程并等待退出；超时强杀兜底。
+    返回迁移完成后需要重新打开的应用路径列表（仅 WorkBuddy 主程序）。"""
+    if sys.platform == "darwin":
+        bundles = mac_app_bundles(procs)
+        for b in bundles:
+            subprocess.run(
+                ["osascript", "-e", 'tell application "%s" to quit' % b],
+                capture_output=True, text=True, errors="replace")
+        if not wait_apps_gone(20):
+            print("      优雅退出超时，发送 SIGTERM ...")
+            kill_running(signal.SIGTERM)
+            if not wait_apps_gone(10):
+                print("      仍未退出，强制结束 ...")
+                kill_running(signal.SIGKILL)
+                if not wait_apps_gone(5):
+                    raise RuntimeError("无法结束 WorkBuddy 进程，请手动退出后重试")
+        return [b for b in bundles if "workbuddy" in os.path.basename(b).lower()]
+    if os.name == "nt":
+        names = sorted({comm for _pid, comm in procs})
+        relaunch = windows_main_exes()
+        for n in names:
+            subprocess.run(["taskkill", "/IM", n], capture_output=True)
+        if not wait_apps_gone(20):
+            for n in names:
+                subprocess.run(["taskkill", "/IM", n, "/F"], capture_output=True)
+            if not wait_apps_gone(10):
+                raise RuntimeError("无法结束 WorkBuddy 进程，请手动退出后重试")
+        return relaunch
+    kill_running(signal.SIGTERM)
+    if not wait_apps_gone(15):
+        kill_running(signal.SIGKILL)
+        if not wait_apps_gone(5):
+            raise RuntimeError("无法结束 WorkBuddy 进程，请手动退出后重试")
+    return []
+
+
+def relaunch_apps(paths):
+    for p in paths:
+        try:
+            if sys.platform == "darwin":
+                subprocess.Popen(["open", "-a", p])
+            else:
+                subprocess.Popen([p])
+        except Exception as ex:
+            print("      重启 %s 失败: %s（请手动打开）" % (p, ex))
+
+
 # ---------------------------------------------------------------- 复制与校验
 
 def run_copy(src, dest):
@@ -301,6 +398,30 @@ def verify_copy(src, dest):
             return True, missing, warning
         return False, missing, None
     return True, missing, warning
+
+
+def verify_strict(src, dest):
+    """源目录静止状态下的严格校验：文件清单与大小必须逐项一致（migrate 用）。
+    与 verify_copy 的区别：copy 在线时源在变化，只能容忍漂移；migrate 关闭了
+    所有写入方，任何不一致都视为失败。"""
+    s = relative_file_set(src)
+    d = relative_file_set(dest)
+    missing = {k: v for k, v in s.items() if k not in d}
+    diff = {k: (v, d[k]) for k, v in s.items() if k in d and d[k] != v}
+    extra = set(d) - set(s)
+    if missing or diff or extra:
+        print("  缺失 %d 个文件" % len(missing))
+        for k in sorted(missing)[:8]:
+            print("    - " + k)
+        print("  大小不一致 %d 个文件" % len(diff))
+        for k in sorted(diff)[:8]:
+            print("    - %s (src %s vs dest %s)" % (k, fmt_bytes(diff[k][0]), fmt_bytes(diff[k][1])))
+        print("  目标多出 %d 个文件（源目录中不存在）" % len(extra))
+        for k in sorted(extra)[:8]:
+            print("    + " + k)
+        return False
+    print("      校验通过：%d 个文件 / %s，逐项一致。" % (len(s), fmt_bytes(sum(s.values()))))
+    return True
 
 
 # ---------------------------------------------------------------- plan 管理
@@ -405,11 +526,11 @@ def cmd_detect(args):
     running, hits = detect_app_running()
     print()
     if running == "running":
-        print("当前检测到 WorkBuddy/CodeBuddy 相关进程 %d 个（swap 前需全部退出）：" % len(hits))
+        print("当前检测到 WorkBuddy/CodeBuddy 相关进程 %d 个（一键 migrate 会自动退出它们）：" % len(hits))
         for pid, name in hits[:8]:
             print("  - [%s] %s" % (pid, name))
     elif running == "unknown":
-        print("无法检测 WorkBuddy 进程状态（当前处于受限沙箱）。若执行 swap，会按运行中处理并拒绝。")
+        print("无法检测 WorkBuddy 进程状态（当前处于受限沙箱）。migrate 需通过 runner 或终端运行。")
     else:
         print("当前未检测到 WorkBuddy/CodeBuddy 运行进程。")
 
@@ -472,6 +593,120 @@ def cmd_copy(args):
     print("    python3 %s make-runner --plan %s" % (os.path.abspath(__file__), path))
 
 
+def cmd_migrate(args):
+    """一键迁移（推荐路径）：自动关闭 WorkBuddy → 单遍复制 → 严格校验
+    → 原目录改名备份+建软链接 → 自动重开 WorkBuddy。
+    重要：本命令会关闭 WorkBuddy，必须以独立进程运行（make-runner 生成的
+    脚本或用户终端），不要在 WorkBuddy 会话内直接执行。"""
+    src = resolve_src(args.src, args.force_any_dir)
+    guard_common(src)
+    cur = link_target(src)
+    if cur is not None:
+        sys.exit("源目录已是软链接(-> %s)，无需迁移；如需换位置请先 rollback。" % cur)
+    if not os.path.isdir(src):
+        sys.exit("源目录不存在: " + src)
+    if args.args_file:
+        af = os.path.abspath(os.path.expanduser(args.args_file))
+        if not os.path.isfile(af):
+            sys.exit("args 文件不存在: " + af)
+        with open(af, encoding="utf-8") as f:
+            data = json.load(f)
+        dest_base = data.get("dest_base")
+        name = data.get("name") or args.name
+        if not dest_base:
+            sys.exit("args 文件缺少 dest_base: " + af)
+    else:
+        if not args.dest_base:
+            sys.exit("请通过 --dest-base 指定目标基准目录（或用 make-runner 生成一键脚本）。")
+        dest_base = args.dest_base
+        name = args.name
+    dest_base = os.path.abspath(os.path.expanduser(dest_base))
+    dest = os.path.join(dest_base, name or os.path.basename(src))
+    if is_within(src, dest) or is_within(dest, src):
+        sys.exit("目标位置与源目录存在嵌套关系，拒绝执行。\n  src=%s\n  dest=%s" % (src, dest))
+    src_bytes, src_files, _ = tree_stats(src)
+    os.makedirs(dest_base, exist_ok=True)
+    free = shutil.disk_usage(dest_base).free
+    if free < src_bytes * 1.02:
+        sys.exit("目标卷剩余空间不足: 需要约 %s（含2%余量），目标卷 %s 仅剩 %s。" % (
+            fmt_bytes(src_bytes), dest_base, fmt_bytes(free)))
+    if os.path.isdir(dest) and os.listdir(dest):
+        print("注意: 目标目录已有内容，将合并复制并在校验时严格比对。")
+
+    manage_apps = (os.path.normpath(src) == os.path.normpath(DEFAULT_SRC)) and not args.skip_app_handling
+    relaunch = []
+    if manage_apps:
+        state, procs = detect_app_running()
+        if state == "unknown":
+            sys.exit(
+                "无法检测 WorkBuddy 进程状态（受限环境: %s）。\n"
+                "migrate 会自动关闭 WorkBuddy，不能在 WorkBuddy 会话内直接运行。\n"
+                "请使用 make-runner 生成的脚本，或在终端中运行本命令。" % procs)
+        if state == "running":
+            print("[1/5] 检测到 WorkBuddy 运行中，自动优雅退出 ...")
+            relaunch = graceful_quit_all(procs)
+            state2, _ = detect_app_running()
+            if state2 != "not-running":
+                sys.exit("自动退出 WorkBuddy 失败，请手动退出后重新运行。")
+            print("      已全部退出，源目录静止。")
+        else:
+            print("[1/5] WorkBuddy 未在运行。")
+    else:
+        print("[1/5] 跳过 WorkBuddy 进程管理（非默认目录或 --skip-app-handling）。")
+
+    print("[2/5] 复制 %s (%s, %d 个文件)" % (src, fmt_bytes(src_bytes), src_files))
+    print("      -> %s （源目录已静止，单遍复制，视磁盘速度可能需要数分钟）" % dest)
+    method = run_copy(src, dest)
+    print("      复制完成（%s）。" % method)
+    print("[3/5] 严格校验（文件清单与大小逐项比对）...")
+    if not verify_strict(src, dest):
+        sys.exit("校验失败。未对源目录做任何改动（原样保留），请排查后重新运行 migrate。")
+    backup = src + BACKUP_SUFFIX
+    if os.path.exists(backup):
+        sys.exit("备份路径已存在，请先处理: " + backup)
+    print("[4/5] 原目录改名备份并创建软链接 ...")
+    os.rename(src, backup)
+    try:
+        make_link(dest, src)
+    except Exception as ex:
+        os.rename(backup, src)
+        sys.exit("创建软链接失败（已自动恢复原目录，未造成损失）:\n  %s\n  %s" % (ex, WIN_SYMLINK_HINT))
+    tgt = link_target(src)
+    if tgt is None or os.path.normpath(os.path.abspath(tgt)) != os.path.normpath(os.path.abspath(dest)):
+        remove_link(src)
+        os.rename(backup, src)
+        sys.exit("链接校验失败，已自动恢复原目录。")
+    plan = {
+        "version": 1,
+        "created_at": now_iso(),
+        "platform": "%s/%s" % (os.name, sys.platform),
+        "method": "migrate",
+        "src": src,
+        "dest": dest,
+        "backup": backup,
+        "src_bytes": src_bytes,
+        "src_files": src_files,
+        "verified": True,
+        "swapped": True,
+        "swapped_at": now_iso(),
+    }
+    path = write_plan(plan)
+    if manage_apps and relaunch and not args.no_relaunch:
+        print("[5/5] 重新启动 WorkBuddy ...")
+        relaunch_apps(relaunch)
+    else:
+        print("[5/5] 跳过自动重启（--no-relaunch 或此前未关闭应用）。")
+    print()
+    print("✓ 一键迁移完成！")
+    print("  %s 现为软链接 -> %s" % (src, dest))
+    print("  旧数据保留在备份: %s" % backup)
+    print("  plan: %s" % path)
+    print("  确认应用稳定运行数日后，可让助手执行清理备份:")
+    print("    python3 %s cleanup-backup --plan %s --yes" % (os.path.abspath(__file__), path))
+    print("  如需回滚（保留迁移副本）: python3 %s rollback --plan %s" % (os.path.abspath(__file__), path))
+    print("  如需彻底恢复原状: python3 %s restore --plan %s" % (os.path.abspath(__file__), path))
+
+
 def require_offline(args):
     state, info = detect_app_running()
     if state != "not-running" and not args.allow_app_running:
@@ -483,7 +718,7 @@ def require_offline(args):
             print("无法检测 WorkBuddy 进程状态（受限环境: %s）。" % info)
         print()
         print("为避免数据竞争，本阶段必须在完全退出 WorkBuddy 的环境执行。")
-        print("推荐：make-runner --plan <plan> 生成退出后可双击运行的独立脚本，")
+        print("推荐使用一键流程：make-runner --dest-base <目录>（自动关闭/重启 WorkBuddy）。")
         print("在 WorkBuddy 会话内直接执行 swap 会被拒绝（exit code 3），这是设计行为。")
         sys.exit(3)
     return state
@@ -539,38 +774,55 @@ def cmd_swap(args):
 
 
 def cmd_make_runner(args):
-    plan = load_plan(args.plan)
-    plan_rel = os.path.basename(plan["plan_path"])
-    command = getattr(args, "command", "swap") or "swap"
+    command = args.command
     os.makedirs(PLAN_DIR, exist_ok=True)
     local_script = os.path.join(PLAN_DIR, "cache_mover.py")
     shutil.copy2(os.path.abspath(__file__), local_script)
+    if command == "migrate":
+        if not args.dest_base:
+            sys.exit("migrate 模式需要 --dest-base <目录>（将创建 <目录>/.workbuddy）。")
+        args_file = os.path.join(PLAN_DIR, "migrate-args.json")
+        payload = {"dest_base": os.path.abspath(os.path.expanduser(args.dest_base))}
+        if args.name:
+            payload["name"] = args.name
+        with open(args_file, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        invoke = 'migrate --args-file "%s"' % os.path.join(PLAN_DIR, "migrate-args.json")
+        banner = [
+            "WorkBuddy cache migration - one-click migrate.",
+            "WorkBuddy will be closed automatically, then relaunched when done.",
+            "Please do NOT use WorkBuddy until this window says Done.",
+        ]
+    else:
+        plan = load_plan(args.plan)
+        plan_rel = os.path.basename(plan["plan_path"])
+        invoke = "%s --plan %s" % (command, os.path.join(PLAN_DIR, plan_rel))
+        banner = [
+            "WorkBuddy cache migration - phase 2 (%s)." % command,
+            "Please make sure WorkBuddy has been QUIT before continuing.",
+            "pause",
+        ]
     if os.name == "nt":
         out = args.out or os.path.join(PLAN_DIR, "run_%s.bat" % command)
-        lines = [
-            "@echo off",
-            "chcp 65001 >nul",
-            "echo WorkBuddy cache migration - phase 2 (%s)." % command,
-            "echo Please make sure WorkBuddy has been QUIT before continuing.",
-            "pause",
-            'py -3 "%USERPROFILE%\\.wb-cache-move\\cache_mover.py" %s --plan "%USERPROFILE%\\.wb-cache-move\\%s"' % (command, plan_rel),
-            'if errorlevel 9009 python "%USERPROFILE%\\.wb-cache-move\\cache_mover.py" %s --plan "%USERPROFILE%\\.wb-cache-move\\%s"' % (command, plan_rel),
-            "echo.",
-            "pause",
-            "",
+        pre = ["@echo off", "chcp 65001 >nul"]
+        py_lines = [
+            'py -3 "%USERPROFILE%\\.wb-cache-move\\cache_mover.py" %s' % invoke,
+            'if errorlevel 9009 python "%USERPROFILE%\\.wb-cache-move\\cache_mover.py" %s' % invoke,
         ]
-        content = "\r\n".join(lines)
+        body = ["pause" if b == "pause" else "echo " + b for b in banner]
+        content = "\r\n".join(pre + body + py_lines + ["echo.", "pause", ""])
         if not content.isascii():
             sys.exit("内部错误: bat 内容必须为 ASCII。")
         with open(out, "w", encoding="ascii", newline="") as f:
             f.write(content)
     else:
         out = args.out or os.path.join(PLAN_DIR, "run_%s.command" % command)
-        content = "\n".join([
-            "#!/bin/bash",
-            "# WorkBuddy cache migration - phase 2 (%s)." % command,
-            "# Quit WorkBuddy completely BEFORE running this.",
-            "",
+        banner_lines = ["#!/bin/bash"]
+        for b in banner:
+            banner_lines.append("# " + b if b == "pause" or b.startswith(("WorkBuddy", "Please")) else b)
+        # pause 仅用于 swap/restore 模式：等待用户确认已退出应用
+        pause_lines = ['read -n 1 -s -r -p "Press any key to start..."'] if "pause" in banner else []
+        content = "\n".join(banner_lines + [""] + [
             'PY=""',
             'for cand in "$(command -v python3)" "$(command -v python)" \\\n'
             '         /opt/homebrew/bin/python3 /usr/local/bin/python3 \\\n'
@@ -579,10 +831,12 @@ def cmd_make_runner(args):
             "done",
             'if [ -z "$PY" ]; then echo "python3 not found"; read -n 1 -s -r -p "Press any key to close..."; exit 1; fi',
             "",
-            '"$PY" "$HOME/.wb-cache-move/cache_mover.py" %s --plan "$HOME/.wb-cache-move/%s"' % (command, plan_rel),
+        ] + pause_lines + [
+            "",
+            '"$PY" "$HOME/.wb-cache-move/cache_mover.py" %s' % invoke,
             'rc=$?',
             'echo ""',
-            'if [ $rc -eq 0 ]; then echo "Done. You can start WorkBuddy again."; else echo "Failed with exit code $rc."; fi',
+            'if [ $rc -eq 0 ]; then echo "Done. WorkBuddy can be used again."; else echo "Failed with exit code $rc."; fi',
             'read -n 1 -s -r -p "Press any key to close..."',
             "",
         ])
@@ -590,10 +844,15 @@ def cmd_make_runner(args):
             f.write(content)
         os.chmod(out, 0o755)
     print("✓ 已生成独立运行脚本: %s" % out)
-    print("  操作序列：")
-    print("  1) 完全退出 WorkBuddy")
-    print("  2) 双击运行 %s （或在终端执行 bash %s）" % (out, out))
-    print("  3) 看到完成提示后，重新打开 WorkBuddy")
+    if command == "migrate":
+        print("  使用方式：双击运行（或在终端执行 bash %s），全自动完成：" % out)
+        print("  自动关闭 WorkBuddy → 复制+校验 → 建软链接 → 自动重新打开 WorkBuddy")
+        print("  迁移目标: %s" % payload["dest_base"])
+    else:
+        print("  操作序列：")
+        print("  1) 完全退出 WorkBuddy")
+        print("  2) 双击运行 %s" % out)
+        print("  3) 看到完成提示后，重新打开 WorkBuddy")
 
 
 def cmd_rollback(args):
@@ -684,7 +943,8 @@ def cmd_restore(args):
         print("[3/4] 迁移目标副本不存在，跳过: %s" % dest)
     print("[4/4] 清理 plan 与 runner 文件 ...")
     removed = []
-    for f in ("run_swap.command", "run_swap.bat",
+    for f in ("run_migrate.command", "run_migrate.bat", "migrate-args.json",
+              "run_swap.command", "run_swap.bat",
               "run_restore.command", "run_restore.bat",
               "cache_mover.py", os.path.basename(plan["plan_path"])):
         fp = os.path.join(PLAN_DIR, f)
@@ -718,23 +978,36 @@ def main():
     d.add_argument("--src", default=None)
     d.set_defaults(func=cmd_detect)
 
-    c = sub.add_parser("copy", help="阶段1：复制数据到目标位置并校验（在线安全）")
+    mg = sub.add_parser("migrate", help="一键迁移：自动关闭 WorkBuddy → 复制 → 校验 → 软链接 → 自动重开")
+    mg.add_argument("--dest-base", default=None, help="目标基准目录，将创建 <基准>/.workbuddy")
+    mg.add_argument("--args-file", default=None, help="从 JSON 文件读取 dest-base/name（runner 用）")
+    mg.add_argument("--name", default=None, help="目标目录名（默认沿用源目录名）")
+    mg.add_argument("--src", default=None, help="源目录（默认 ~/.workbuddy）")
+    mg.add_argument("--force-any-dir", action="store_true", help="允许操作非默认目录（测试用）")
+    mg.add_argument("--skip-app-handling", action="store_true",
+                    help="不自动关闭/重开 WorkBuddy（非默认目录自动生效）")
+    mg.add_argument("--no-relaunch", action="store_true", help="迁移完成后不自动重新打开 WorkBuddy")
+    mg.set_defaults(func=cmd_migrate)
+
+    c = sub.add_parser("copy", help="旧版阶段1：在线复制（不推荐，遇文件锁/文件变化；建议用 migrate）")
     c.add_argument("--dest-base", required=True, help="目标基准目录，将创建 <基准>/.workbuddy")
     c.add_argument("--name", default=None, help="目标目录名（默认沿用源目录名）")
     c.add_argument("--src", default=None, help="源目录（默认 ~/.workbuddy）")
     c.add_argument("--force-any-dir", action="store_true", help="允许操作非默认目录（测试用）")
     c.set_defaults(func=cmd_copy)
 
-    s = sub.add_parser("swap", help="阶段2：改名备份+创建软链接（须退出 WorkBuddy）")
+    s = sub.add_parser("swap", help="旧版阶段2：改名备份+创建软链接（不推荐，建议用 migrate）")
     s.add_argument("--plan", required=True, help="plan 文件路径，或 latest")
     s.add_argument("--allow-app-running", action="store_true",
                    help="跳过进程检测（仅当明确知晓风险时使用）")
     s.set_defaults(func=cmd_swap)
 
-    m = sub.add_parser("make-runner", help="生成退出 WorkBuddy 后可双击运行的离线脚本（swap/restore）")
-    m.add_argument("--plan", required=True, help="plan 文件路径，或 latest")
-    m.add_argument("--command", choices=["swap", "restore"], default="swap",
-                   help="生成哪种动作的 runner（默认 swap）")
+    m = sub.add_parser("make-runner", help="生成可双击运行的独立脚本（默认一键 migrate 模式）")
+    m.add_argument("--command", choices=["migrate", "swap", "restore"], default="migrate",
+                   help="生成哪种动作的 runner（默认 migrate 一键模式）")
+    m.add_argument("--dest-base", default=None, help="migrate 模式的目标基准目录")
+    m.add_argument("--name", default=None, help="migrate 模式的目标目录名")
+    m.add_argument("--plan", default="latest", help="swap/restore 模式使用的 plan（默认 latest）")
     m.add_argument("--out", default=None, help="输出脚本路径")
     m.set_defaults(func=cmd_make_runner)
 
