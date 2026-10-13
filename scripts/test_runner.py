@@ -80,7 +80,7 @@ class RunnerTests(unittest.TestCase):
             out = os.path.join(root, "桌面", "运行.bat")
             args = argparse.Namespace(command="migrate", dest_base="D:\\用户数据\\缓存",
                                       name=None, plan="latest", out=out)
-            with mock.patch.object(mover, "PLAN_DIR", plan_dir), mock.patch.object(mover.os, "name", "nt"):
+            with mock.patch.object(mover, "PLAN_DIR", plan_dir), mock.patch.object(mover.os, "name", "nt"), mock.patch.object(mover, "operation_lock", return_value=contextlib.nullcontext()):
                 with contextlib.redirect_stdout(io.StringIO()):
                     mover.cmd_make_runner(args)
             with open(out, "rb") as f:
@@ -98,10 +98,10 @@ class RunnerTests(unittest.TestCase):
             os.makedirs(plan_dir)
             plan_path = os.path.join(plan_dir, "plan-中文.json")
             with open(plan_path, "w", encoding="utf-8") as f:
-                json.dump({"src": "unused", "dest": "unused", "backup": "unused"}, f)
+                json.dump({"src": os.path.join(root, "source"), "dest": os.path.join(root, "destination"), "backup": os.path.join(root, "backup")}, f)
             args = argparse.Namespace(command="restore", dest_base=None,
                                       name=None, plan=plan_path, out=None)
-            with mock.patch.object(mover, "PLAN_DIR", plan_dir), mock.patch.object(mover.os, "name", "nt"):
+            with mock.patch.object(mover, "PLAN_DIR", plan_dir), mock.patch.object(mover.os, "name", "nt"), mock.patch.object(mover, "operation_lock", return_value=contextlib.nullcontext()):
                 with contextlib.redirect_stdout(io.StringIO()):
                     mover.cmd_make_runner(args)
             with open(os.path.join(plan_dir, "run_restore.bat"), "rb") as f:
@@ -144,20 +144,18 @@ class RunnerTests(unittest.TestCase):
             with open(os.path.join(log_dir, os.listdir(log_dir)[0]), encoding="utf-8") as f:
                 self.assertIn("JSONDecodeError", f.read())
 
-    def test_robocopy_output_and_result_codes(self):
+    def test_stream_copy_has_exact_bytes_and_detects_same_size_corruption(self):
         with tempfile.TemporaryDirectory(prefix="wb-copy-") as root:
-            with mock.patch.object(mover.shutil, "which", return_value=None), mock.patch.object(mover.os, "name", "nt"):
-                for rc in (3, 8):
-                    proc = mock.Mock(stdout=io.StringIO("复制状态\n"))
-                    proc.wait.return_value = rc
-                    console = io.StringIO()
-                    with mock.patch.object(mover.subprocess, "Popen", return_value=proc), contextlib.redirect_stdout(console):
-                        if rc >= 8:
-                            with self.assertRaises(RuntimeError):
-                                mover.run_copy(root, os.path.join(root, "dest"))
-                        else:
-                            self.assertEqual(mover.run_copy(root, os.path.join(root, "dest")), "robocopy")
-                    self.assertIn("复制状态", console.getvalue())
+            source, target = os.path.join(root, 'source'), os.path.join(root, 'dest')
+            os.mkdir(source)
+            with open(os.path.join(source, '中文.bin'), 'wb') as f:
+                f.write(b'abcd')
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(mover.run_copy(source, target), 'python-stream')
+                self.assertTrue(mover.verify_strict(source, target))
+                with open(os.path.join(target, '中文.bin'), 'wb') as f:
+                    f.write(b'wxyz')
+                self.assertFalse(mover.verify_strict(source, target))
 
 
 if __name__ == "__main__":
