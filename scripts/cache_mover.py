@@ -596,16 +596,156 @@ def cmd_copy(args):
     print("    python3 %s make-runner --plan %s" % (os.path.abspath(__file__), path))
 
 
+def _cmd_redirect(args, src, cur):
+    """重定向迁移：当前数据在 A（软链接指向），直接搬到新目标 B。
+    数据源 = A 的当前实际内容（含历次迁移后全部变更），与旧快照无关。"""
+    old_dest = os.path.abspath(cur)
+    if args.args_file:
+        af = os.path.abspath(os.path.expanduser(args.args_file))
+        if not os.path.isfile(af):
+            sys.exit("args 文件不存在: " + af)
+        with open(af, encoding="utf-8") as f:
+            data = json.load(f)
+        dest_base = data.get("dest_base")
+        name = data.get("name") or args.name
+        if not dest_base:
+            sys.exit("args 文件缺少 dest_base: " + af)
+    else:
+        dest_base = args.dest_base
+        name = args.name
+    if not dest_base:
+        sys.exit("请通过 --dest-base 指定新目标基准目录。")
+    dest_base = os.path.abspath(os.path.expanduser(dest_base))
+    new_dest = os.path.join(dest_base, name or os.path.basename(src))
+    if os.path.normpath(new_dest) == os.path.normpath(old_dest):
+        sys.exit("新目标 %s 与当前实际位置相同，无需迁移。" % new_dest)
+    if not os.path.isdir(old_dest):
+        sys.exit("软链接指向的实际位置不存在: %s，请人工检查。" % old_dest)
+    if is_within(old_dest, new_dest) or is_within(new_dest, old_dest):
+        sys.exit("新目标与当前实际位置存在嵌套关系，拒绝执行。\n  当前: %s\n  新目标: %s" % (old_dest, new_dest))
+    if os.path.isdir(new_dest) and os.listdir(new_dest):
+        sys.exit("新目标目录已存在且非空，为避免数据混淆拒绝执行: %s" % new_dest)
+    src_bytes, src_files, _ = tree_stats(old_dest)
+    os.makedirs(dest_base, exist_ok=True)
+    free = shutil.disk_usage(dest_base).free
+    same_vol = os.stat(os.path.dirname(old_dest)).st_dev == os.stat(dest_base).st_dev
+
+    manage_apps = (os.path.normpath(src) == os.path.normpath(DEFAULT_SRC)) and not args.skip_app_handling
+    relaunch = []
+    if manage_apps:
+        state, procs = detect_app_running()
+        if state == "unknown":
+            sys.exit("无法检测 WorkBuddy 进程状态（受限环境）。请通过 runner 或终端运行。")
+        if state == "running":
+            print("[1/5] 检测到 WorkBuddy 运行中，自动优雅退出 ...")
+            relaunch = graceful_quit_all(procs)
+            state2, _ = detect_app_running()
+            if state2 != "not-running":
+                sys.exit("自动退出 WorkBuddy 失败，请手动退出后重新运行。")
+        else:
+            print("[1/5] WorkBuddy 未在运行。")
+    else:
+        print("[1/5] 跳过 WorkBuddy 进程管理（非默认目录或 --skip-app-handling）。")
+
+    print("[2/5] 数据从当前实际位置迁到新目标（数据源=当前实际内容，含全部变更）...")
+    print("      %s (%s, %d 个文件) -> %s" % (old_dest, fmt_bytes(src_bytes), src_files, new_dest))
+    moved = False
+    if same_vol:
+        try:
+            os.rename(old_dest, new_dest)
+            moved = True
+            print("      同卷瞬时移动完成。")
+        except OSError:
+            pass
+    if not moved:
+        if free < src_bytes * 1.02:
+            sys.exit("目标卷剩余空间不足: 需要约 %s（含2%余量），仅剩 %s。" % (fmt_bytes(src_bytes), fmt_bytes(free)))
+        run_copy(old_dest, new_dest)
+        print("      复制完成，严格校验 ...")
+        if not verify_strict(old_dest, new_dest):
+            sys.exit("校验失败。当前数据仍在 %s 未动；软链接未变，请排查后重试。" % old_dest)
+
+    print("[3/5] 切换软链接指向 ...")
+    remove_link(src)
+    try:
+        make_link(new_dest, src)
+    except Exception as ex:
+        # 链接创建失败时恢复指向旧位置（rename 场景旧位置已不存在，改试新位置重试）
+        try:
+            make_link(old_dest if os.path.isdir(old_dest) else new_dest, src)
+        except Exception:
+            pass
+        sys.exit("切换软链接失败（已尝试恢复原链接）: %s\n数据完好，位置: %s" % (ex, new_dest if not os.path.isdir(old_dest) else old_dest))
+    tgt = link_target(src)
+    if tgt is None or os.path.normpath(os.path.abspath(tgt)) != os.path.normpath(os.path.abspath(new_dest)):
+        sys.exit("链接校验失败。数据完好，位置: %s；请人工执行: ln -s '%s' '%s'" % (new_dest, new_dest, src))
+
+    print("[4/5] 清理旧位置数据 ...")
+    if args.keep_backup:
+        print("      按要求保留旧位置数据: %s" % old_dest)
+        kept = True
+    else:
+        kept = False
+        if os.path.isdir(old_dest):
+            try:
+                msg = trash_path(old_dest)
+                print("      " + msg)
+            except RuntimeError as ex:
+                kept = True
+                print("      自动清理失败（%s），旧数据保留在 %s。" % (ex, old_dest))
+        else:
+            print("      旧位置数据已随同卷移动消失，无需清理。")
+        if not kept:
+            _rmdir_if_empty(os.path.dirname(old_dest))
+
+    if manage_apps and relaunch and not args.no_relaunch:
+        print("[5/5] 重新启动 WorkBuddy ...")
+        relaunch_apps(relaunch)
+    else:
+        print("[5/5] 跳过自动重启。")
+
+    # 更新 plan：优先更新既有 plan（latest），否则新建
+    try:
+        plan = load_plan("latest")
+        plan.update(dest=new_dest, backup=src + BACKUP_SUFFIX, swapped=True,
+                    swapped_at=now_iso(), redirected_from=old_dest)
+        plan["src_bytes"], plan["src_files"] = src_bytes, src_files
+        save_plan(plan)
+        path = plan["plan_path"]
+    except SystemExit:
+        plan = {
+            "version": 1, "created_at": now_iso(),
+            "platform": "%s/%s" % (os.name, sys.platform),
+            "method": "redirect", "src": src, "dest": new_dest,
+            "backup": src + BACKUP_SUFFIX, "src_bytes": src_bytes,
+            "src_files": src_files, "verified": True, "swapped": True,
+            "swapped_at": now_iso(), "redirected_from": old_dest,
+        }
+        path = write_plan(plan)
+    print()
+    print("✓ 重定向迁移完成！")
+    print("  %s 现为软链接 -> %s （原指向 %s）" % (src, new_dest, old_dest))
+    print("  plan: %s" % path)
+    if kept:
+        print("  旧位置数据保留在: %s，确认后可手动删除。" % old_dest)
+    print("  回滚（数据迁回默认路径）: python3 %s rollback --plan %s" % (os.path.abspath(__file__), path))
+    print("  彻底恢复原状: python3 %s restore --plan %s" % (os.path.abspath(__file__), path))
+
+
 def cmd_migrate(args):
     """一键迁移（推荐路径）：自动关闭 WorkBuddy → 单遍复制 → 严格校验
     → 原目录改名备份+建软链接 → 自动重开 WorkBuddy。
+    若源路径已是软链接（此前已迁移到位置 A），自动切换为「重定向迁移」：
+    数据从 A 直接搬到新目标 B（同卷 rename / 跨卷复制+校验），软链接改指 B，
+    A 原位置清理，无需先 rollback 回默认路径。
     重要：本命令会关闭 WorkBuddy，必须以独立进程运行（make-runner 生成的
     脚本或用户终端），不要在 WorkBuddy 会话内直接执行。"""
     src = resolve_src(args.src, args.force_any_dir)
     guard_common(src)
     cur = link_target(src)
     if cur is not None:
-        sys.exit("源目录已是软链接(-> %s)，无需迁移；如需换位置请先 rollback。" % cur)
+        _cmd_redirect(args, src, cur)
+        return
     if not os.path.isdir(src):
         sys.exit("源目录不存在: " + src)
     if args.args_file:
