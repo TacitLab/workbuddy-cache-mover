@@ -1232,8 +1232,6 @@ def cmd_run_job(args):
 def windows_runner_content(job_name):
     return '\r\n'.join([
         '@echo off', 'setlocal DisableDelayedExpansion',
-        'if /I "%~1"=="--console" goto run',
-        '"%ComSpec%" /D /S /V:OFF /K ""%~f0" --console"', 'exit /b', ':run',
         'chcp 65001 >nul', 'title WorkBuddy cache mover',
         'echo Preparing. Do not reopen WorkBuddy during the operation.',
         'set "PYEXE="', 'set "PYFLAG="',
@@ -1246,7 +1244,8 @@ def windows_runner_content(job_name):
         'set "RC=%ERRORLEVEL%"', ':finish', 'echo.',
         'echo Exit code: %RC% - 0=success, 2=completed with warnings, 3=recovery required, 4=busy, 5=environment unsupported.',
         'echo Logs: "%LOCALAPPDATA%\\WorkBuddyCacheMover\\logs"',
-        'echo This window stays open. Read the result, then close it or type EXIT.', 'exit /b %RC%',
+        'echo This window stays open. Read the result, then close it or type EXIT.',
+        '"%ComSpec%" /D /Q /V:OFF /K', 'exit /b %RC%',
         ':try_python', 'if /I "%~dp1"=="%LOCALAPPDATA%\\Microsoft\\WindowsApps\\" exit /b 0',
         '"%~1" %~2 -c "import sys; sys.exit(0 if sys.version_info >= (3, 8) else 1)" >nul 2>&1',
         'if errorlevel 1 exit /b 0', 'set "PYEXE=%~1"', 'set "PYFLAG=%~2"', 'exit /b 0', ''

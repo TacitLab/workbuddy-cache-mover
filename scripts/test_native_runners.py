@@ -56,10 +56,10 @@ class NativeRunnerTests(unittest.TestCase):
             path = os.path.join(folder, 'run.bat')
             with open(path, 'w', encoding='ascii', newline='') as f:
                 f.write(m.windows_runner_content('broken.json'))
-            command = '"%s" /D /S /V:OFF /C ""%s""' % (os.environ['COMSPEC'], path)
+            command = [os.environ['COMSPEC'], '/D', '/V:OFF', '/C', 'run.bat']
             process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                        stderr=subprocess.STDOUT, text=True, encoding='utf-8',
-                                       errors='replace', env=env, bufsize=1)
+                                       errors='replace', env=env, cwd=folder, bufsize=1)
             lines, ready = [], threading.Event()
             def read_until_result():
                 for line in process.stdout:
