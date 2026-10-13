@@ -1,0 +1,624 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+WorkBuddy 缓存目录迁移工具（workbuddy-cache-mover）
+
+把 ~/.workbuddy 主数据/缓存目录迁移到其他磁盘位置，并在原路径创建
+软链接（macOS/Linux: symlink；Windows: junction），在"应用内无法修改
+缓存目录"的前提下实现实际存储位置变更，对 WorkBuddy 完全透明。
+
+范围红线：只迁移 ~/.workbuddy。~/Library/Caches、
+~/Library/Application Support 等 Electron 缓存/用户数据一律不碰。
+
+子命令:
+  detect                              查看 ~/.workbuddy 状态/体积分布/磁盘空间
+  copy    --dest-base <dir>           阶段1（在线安全）：复制数据到目标并校验
+  swap    --plan <plan.json>          阶段2（须退出 WorkBuddy）：改名备份+建软链接
+  make-runner --plan <plan.json>      生成退出 WorkBuddy 后可双击运行的独立脚本
+  rollback --plan <plan.json>         回滚：移除软链接，恢复原目录
+
+仅使用标准库，无第三方依赖。Python >= 3.8。
+"""
+
+import argparse
+import codecs
+import datetime
+import glob as globmod
+import json
+import os
+import re
+import shutil
+import stat as statmod
+import subprocess
+import sys
+import time
+
+DEFAULT_SRC = os.path.join(os.path.expanduser("~"), ".workbuddy")
+PLAN_DIR = os.path.join(os.path.expanduser("~"), ".wb-cache-move")
+BACKUP_SUFFIX = ".wb-migration-backup"
+NAME_PAT = re.compile(r"(workbuddy|codebuddy)", re.IGNORECASE)
+WIN_SYMLINK_HINT = (
+    "Windows 下创建目录链接优先使用 junction（mklink /J，无需管理员权限，但要求目标在本地卷）。"
+    "若目标是网络路径(UNC)，需要管理员权限创建真正的 symlink，"
+    "或以管理员身份运行：mklink /D \"<原路径>\" \"<目标路径>\"。"
+)
+
+
+def _utf8_guard():
+    """Windows 控制台编码兜底，避免中文输出报错。"""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            enc = getattr(stream, "encoding", None)
+            if enc and codecs.lookup(enc).name != "utf-8":
+                stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
+def now_iso():
+    return datetime.datetime.now().isoformat(timespec="seconds")
+
+
+def fmt_bytes(n):
+    f = float(n)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if f < 1024 or unit == "TB":
+            return ("%.1f%s" % (f, unit)) if unit != "B" else ("%dB" % int(f))
+        f /= 1024.0
+    return "%dB" % n
+
+
+def is_within(parent, child):
+    parent = os.path.normpath(parent)
+    child = os.path.normpath(child)
+    return child == parent or child.startswith(parent + os.sep)
+
+
+def tree_stats(path):
+    """目录总体积（不含目录项自身开销）与文件数。不跟随内部软链接。"""
+    total, files, errors = 0, 0, 0
+    stack = [path]
+    while stack:
+        p = stack.pop()
+        try:
+            with os.scandir(p) as it:
+                for e in it:
+                    try:
+                        if e.is_dir(follow_symlinks=False):
+                            stack.append(e.path)
+                        else:
+                            total += e.stat(follow_symlinks=False).st_size
+                            files += 1
+                    except OSError:
+                        errors += 1
+        except OSError:
+            errors += 1
+    return total, files, errors
+
+
+def relative_file_set(path):
+    """返回 {相对路径: 文件大小}，用于校验 dest 覆盖了 src 的所有文件。"""
+    out = {}
+    for root, _dirs, fnames in os.walk(path, followlinks=False):
+        for fn in fnames:
+            fp = os.path.join(root, fn)
+            rel = os.path.relpath(fp, path)
+            try:
+                out[rel] = os.lstat(fp).st_size
+            except OSError:
+                pass
+    return out
+
+
+def link_target(path):
+    """若 path 是软链接/Windows junction，返回其目标；否则返回 None。"""
+    if not os.path.lexists(path):
+        return None
+    if os.path.islink(path):
+        return os.readlink(path)
+    if os.name == "nt" and is_reparse_dir(path):
+        return os.path.realpath(path)
+    return None
+
+
+def is_reparse_dir(path):
+    try:
+        st = os.lstat(path)
+        return bool(getattr(st, "st_file_attributes", 0) & 0x400) and statmod.S_ISDIR(st.st_mode)
+    except OSError:
+        return False
+
+
+def make_link(target, link_path):
+    """在 link_path 创建指向 target 的链接（目录）。"""
+    target = os.path.abspath(target)
+    if os.name == "nt":
+        if target.startswith("\\\\"):  # UNC 网络路径，junction 不支持，需管理员 symlink
+            os.symlink(target, link_path, target_is_directory=True)
+            return
+        r = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", link_path, target],
+            capture_output=True, text=True, errors="replace",
+        )
+        if r.returncode != 0:
+            raise RuntimeError("mklink /J 失败: %s%s" % ((r.stdout or "").strip(), (r.stderr or "").strip()))
+        return
+    os.symlink(target, link_path)
+
+
+def remove_link(link_path):
+    """移除软链接/ junction 本身（不影响目标内容）。"""
+    if os.path.islink(link_path):
+        os.unlink(link_path)
+        return
+    if os.name == "nt" and is_reparse_dir(link_path):
+        r = subprocess.run(
+            ["cmd", "/c", "rmdir", link_path],
+            capture_output=True, text=True, errors="replace",
+        )
+        if r.returncode != 0:
+            raise RuntimeError("rmdir junction 失败: %s%s" % ((r.stdout or "").strip(), (r.stderr or "").strip()))
+        return
+    raise RuntimeError("路径不是软链接/junction: " + link_path)
+
+
+def detect_app_running():
+    """检测 WorkBuddy/CodeBuddy 相关进程是否在运行。
+    返回 (state, info)：state ∈ "running" | "not-running" | "unknown"。
+    沙箱/受限环境下 ps/tasklist 会被拒绝（PermissionError），此时返回
+    "unknown"（宁可误拦不可漏拦，fail-closed）。"""
+    hits = []
+    try:
+        if os.name == "nt":
+            r = subprocess.run(
+                ["tasklist", "/FO", "CSV", "/NH"],
+                capture_output=True, text=True, errors="replace",
+            )
+            for line in (r.stdout or "").splitlines():
+                if not line.strip():
+                    continue
+                name = line.split('","')[0].strip().strip('"')
+                if NAME_PAT.search(name):
+                    hits.append(("-", name))
+        else:
+            r = subprocess.run(
+                ["ps", "-axo", "pid=,comm="],
+                capture_output=True, text=True, errors="replace",
+            )
+            for line in (r.stdout or "").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                pid, _, comm = line.partition(" ")
+                base = os.path.basename(comm.strip()).lower()
+                if NAME_PAT.search(base) and not base.startswith(
+                    ("python", "bash", "zsh", "dash", "sh", "node", "rg", "grep", "cat", "ps")
+                ):
+                    hits.append((pid, comm.strip()))
+    except Exception as ex:
+        # 沙箱拒绝执行 ps/tasklist 等：无法判断，按 unknown 处理
+        return "unknown", "%s: %s" % (type(ex).__name__, ex)
+    return ("running" if hits else "not-running"), hits
+
+
+# ---------------------------------------------------------------- 复制与校验
+
+def run_copy(src, dest):
+    """单次全量/增量复制。返回所用方法名。"""
+    os.makedirs(dest, exist_ok=True)
+    if os.name != "nt" and shutil.which("rsync"):
+        r = subprocess.run(
+            ["rsync", "-a", "--", src + os.sep, dest + os.sep],
+            capture_output=True, text=True, errors="replace",
+        )
+        if r.returncode != 0:
+            raise RuntimeError("rsync 失败(退出码 %d): %s" % (r.returncode, (r.stderr or "")[:500]))
+        return "rsync"
+    if os.name == "nt":
+        rc = subprocess.call([
+            "robocopy", src, dest,
+            "/E", "/COPY:DAT", "/DCOPY:DAT", "/R:2", "/W:1", "/NFL", "/NDL", "/NP",
+        ])
+        if rc >= 8:
+            raise RuntimeError("robocopy 失败，退出码 %d" % rc)
+        return "robocopy"
+    # 纯 Python 兜底
+    errors = []
+    with os.scandir(src) as it:
+        entries = list(it)
+    for entry in entries:
+        s = entry.path
+        d = os.path.join(dest, entry.name)
+        try:
+            if entry.is_symlink():
+                if os.path.lexists(d):
+                    os.unlink(d)
+                os.symlink(os.readlink(s), d)
+            elif entry.is_dir(follow_symlinks=False):
+                shutil.copytree(s, d, symlinks=True, dirs_exist_ok=True)
+            else:
+                shutil.copy2(s, d)
+        except Exception as ex:
+            errors.append((s, str(ex)))
+    if errors:
+        raise RuntimeError("复制失败 %d 项，示例: %s" % (len(errors), errors[0]))
+    return "pycopy"
+
+
+def verify_copy(src, dest):
+    """校验 dest 覆盖了 src 的所有文件。运行中的应用持续写入少量新文件属正常，
+    允许 <=10 个且合计 <5MB 的缺口（记录 warning）。"""
+    s = relative_file_set(src)
+    d = relative_file_set(dest)
+    missing = {k: v for k, v in s.items() if k not in d}
+    missing_bytes = sum(missing.values())
+    warning = None
+    if missing:
+        if len(missing) <= 10 and missing_bytes < 5 * 1024 * 1024:
+            warning = "%d 个运行中新写入的小文件(%s)未及同步，已按可接受漂移忽略。" % (
+                len(missing), fmt_bytes(missing_bytes))
+            return True, missing, warning
+        return False, missing, None
+    return True, missing, warning
+
+
+# ---------------------------------------------------------------- plan 管理
+
+def write_plan(plan):
+    os.makedirs(PLAN_DIR, exist_ok=True)
+    ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    path = os.path.join(PLAN_DIR, "plan-%s.json" % ts)
+    i = 1
+    while os.path.exists(path):
+        path = os.path.join(PLAN_DIR, "plan-%s-%d.json" % (ts, i))
+        i += 1
+    plan["plan_path"] = path
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(plan, f, ensure_ascii=False, indent=2)
+    return path
+
+
+def load_plan(ref):
+    if ref == "latest":
+        cands = sorted(globmod.glob(os.path.join(PLAN_DIR, "plan-*.json")))
+        if not cands:
+            sys.exit("没有找到任何 plan 文件（%s/plan-*.json），请先执行 copy。" % PLAN_DIR)
+        ref = cands[-1]
+    path = os.path.abspath(os.path.expanduser(ref))
+    if not os.path.isfile(path):
+        sys.exit("plan 文件不存在: " + path)
+    with open(path, encoding="utf-8") as f:
+        plan = json.load(f)
+    plan["plan_path"] = path
+    return plan
+
+
+def save_plan(plan):
+    with open(plan["plan_path"], "w", encoding="utf-8") as f:
+        json.dump(plan, f, ensure_ascii=False, indent=2)
+
+
+# ---------------------------------------------------------------- 子命令
+
+def resolve_src(args_src, force_any_dir):
+    src = os.path.abspath(os.path.expanduser(args_src or DEFAULT_SRC))
+    if os.path.normpath(src) != os.path.normpath(DEFAULT_SRC) and not force_any_dir:
+        sys.exit(
+            "安全限制：本工具只迁移默认目录 %s。\n"
+            "如确需操作其他目录（如测试），加 --force-any-dir 显式确认。" % DEFAULT_SRC
+        )
+    return src
+
+
+def guard_common(src):
+    home = os.path.expanduser("~")
+    if src in ("/", home, os.path.dirname(home)):
+        sys.exit("拒绝操作系统级/用户主目录本身: " + src)
+    if is_within(PLAN_DIR, src) or os.path.normpath(src) == os.path.normpath(PLAN_DIR):
+        sys.exit("拒绝操作 plan 存放目录: " + src)
+
+
+def cmd_detect(args):
+    src = os.path.abspath(os.path.expanduser(args.src or DEFAULT_SRC))
+    guard_common(src)
+    print("系统环境: %s (%s)" % (os.name.upper(), sys.platform))
+    print("目标目录: %s" % src)
+    tgt = link_target(src)
+    backup = src + BACKUP_SUFFIX
+    print("磁盘剩余空间(主目录所在卷): %s 可用 / 共 %s" % (
+        fmt_bytes(shutil.disk_usage(home_of(src)).free),
+        fmt_bytes(shutil.disk_usage(home_of(src)).total)))
+    if tgt is not None:
+        print()
+        print("[已迁移状态] %s 是软链接 -> %s" % (src, tgt))
+        if os.path.isdir(src):
+            b, n, _ = tree_stats(src)
+            print("  实际数据(经链接读取): %s / %d 个文件" % (fmt_bytes(b), n))
+        if os.path.isdir(backup):
+            print("  旧数据备份仍在: %s" % backup)
+        plans = sorted(globmod.glob(os.path.join(PLAN_DIR, "plan-*.json")))
+        if plans:
+            print("  最近的 plan: %s （rollback --plan %s 可回滚）" % (plans[-1], plans[-1]))
+        return
+    if not os.path.isdir(src):
+        print("目录不存在，无需迁移。")
+        return
+    total, files, errors = tree_stats(src)
+    print()
+    print("[待迁移状态] 普通目录，总体积 %s / %d 个文件%s" % (
+        fmt_bytes(total), files, ("（%d 项读取失败）" % errors) if errors else ""))
+    print()
+    print("体积 Top 子目录：")
+    rows = []
+    with os.scandir(src) as it:
+        for e in it:
+            try:
+                if e.is_dir(follow_symlinks=False):
+                    rows.append((e.name, tree_stats(e.path)[0]))
+                else:
+                    rows.append((e.name, e.stat(follow_symlinks=False).st_size))
+            except OSError:
+                rows.append((e.name, -1))
+    for name, size in sorted(rows, key=lambda x: -(x[1] if x[1] > 0 else 0))[:12]:
+        print("  %-28s %s" % (name, fmt_bytes(size) if size >= 0 else "读取失败"))
+    running, hits = detect_app_running()
+    print()
+    if running == "running":
+        print("当前检测到 WorkBuddy/CodeBuddy 相关进程 %d 个（swap 前需全部退出）：" % len(hits))
+        for pid, name in hits[:8]:
+            print("  - [%s] %s" % (pid, name))
+    elif running == "unknown":
+        print("无法检测 WorkBuddy 进程状态（当前处于受限沙箱）。若执行 swap，会按运行中处理并拒绝。")
+    else:
+        print("当前未检测到 WorkBuddy/CodeBuddy 运行进程。")
+
+
+def home_of(path):
+    return os.path.expanduser("~")
+
+
+def cmd_copy(args):
+    src = resolve_src(args.src, args.force_any_dir)
+    guard_common(src)
+    if link_target(src) is not None:
+        sys.exit("源目录已是软链接(-> %s)，无需再迁移；如需换位置请先 rollback。" % link_target(src))
+    if not os.path.isdir(src):
+        sys.exit("源目录不存在: " + src)
+    dest_base = os.path.abspath(os.path.expanduser(args.dest_base))
+    dest = os.path.join(dest_base, args.name or os.path.basename(src))
+    if is_within(src, dest) or is_within(dest, src):
+        sys.exit("目标位置与源目录存在嵌套关系，拒绝执行。\n  src=%s\n  dest=%s" % (src, dest))
+    src_bytes, src_files, _ = tree_stats(src)
+    os.makedirs(dest_base, exist_ok=True)
+    free = shutil.disk_usage(dest_base).free
+    if free < src_bytes * 1.02:
+        sys.exit(
+            "目标卷剩余空间不足: 需要约 %s（含2%余量），目标卷 %s 仅剩 %s。" % (
+                fmt_bytes(src_bytes), dest_base, fmt_bytes(free)))
+    print("[1/3] 复制 %s (%s, %d 个文件)" % (src, fmt_bytes(src_bytes), src_files))
+    print("      -> %s （视磁盘速度可能需要数分钟）" % dest)
+    method = run_copy(src, dest)
+    print("[2/3] 增量二次同步，收敛运行中新增文件 ... (%s)" % method)
+    run_copy(src, dest)
+    print("[3/3] 校验完整性 ...")
+    ok, missing, warning = verify_copy(src, dest)
+    if not ok:
+        print("校验失败：%d 个文件未复制到目标(合计 %s)，不生成 plan，禁止 swap。" % (
+            len(missing), fmt_bytes(sum(missing.values()))))
+        for k in sorted(missing)[:10]:
+            print("  - " + k)
+        sys.exit(1)
+    if warning:
+        print("警告: " + warning)
+    plan = {
+        "version": 1,
+        "created_at": now_iso(),
+        "platform": "%s/%s" % (os.name, sys.platform),
+        "src": src,
+        "dest": dest,
+        "backup": src + BACKUP_SUFFIX,
+        "src_bytes": src_bytes,
+        "src_files": src_files,
+        "verified": True,
+        "swapped": False,
+    }
+    path = write_plan(plan)
+    print()
+    print("✓ 复制与校验完成，plan 已写入: %s" % path)
+    print("  下一步（必须先完全退出 WorkBuddy）:")
+    print("    python3 %s swap --plan %s" % (os.path.abspath(__file__), path))
+    print("  若在 WorkBuddy 内操作，用 make-runner 生成退出后可双击运行的脚本:")
+    print("    python3 %s make-runner --plan %s" % (os.path.abspath(__file__), path))
+
+
+def require_offline(args):
+    state, info = detect_app_running()
+    if state != "not-running" and not args.allow_app_running:
+        if state == "running":
+            print("检测到 WorkBuddy/CodeBuddy 正在运行：")
+            for pid, name in info[:10]:
+                print("  - [%s] %s" % (pid, name))
+        else:
+            print("无法检测 WorkBuddy 进程状态（受限环境: %s）。" % info)
+        print()
+        print("为避免数据竞争，本阶段必须在完全退出 WorkBuddy 的环境执行。")
+        print("推荐：make-runner --plan <plan> 生成退出后可双击运行的独立脚本，")
+        print("在 WorkBuddy 会话内直接执行 swap 会被拒绝（exit code 3），这是设计行为。")
+        sys.exit(3)
+    return state
+
+
+def cmd_swap(args):
+    plan = load_plan(args.plan)
+    src, dest, backup = plan["src"], plan["dest"], plan["backup"]
+    if not plan.get("verified"):
+        sys.exit("该 plan 未通过校验，请重新执行 copy。")
+    cur = link_target(src)
+    if cur is not None:
+        if os.path.normpath(os.path.abspath(cur)) == os.path.normpath(os.path.abspath(dest)):
+            print("已迁移完成，无需重复操作：%s -> %s" % (src, dest))
+            return
+        sys.exit("源路径已是软链接但指向 %s，与 plan 目标 %s 不一致，请人工检查。" % (cur, dest))
+    if not os.path.isdir(dest):
+        sys.exit("目标目录不存在(是否被移动/删除?): " + dest)
+    if os.path.exists(backup):
+        sys.exit("备份路径已存在，请先处理: " + backup)
+    require_offline(args)
+    print("[1/3] 最终增量同步 ...")
+    run_copy(src, dest)
+    ok, missing, warning = verify_copy(src, dest)
+    if not ok:
+        sys.exit("最终校验失败: %d 个文件缺失(合计 %s)。" % (len(missing), fmt_bytes(sum(missing.values()))))
+    if warning:
+        print("警告: " + warning)
+    print("[2/3] 原目录改名备份: %s -> %s" % (src, backup))
+    os.rename(src, backup)
+    print("[3/3] 创建软链接: %s -> %s" % (src, dest))
+    try:
+        make_link(dest, src)
+    except Exception as ex:
+        os.rename(backup, src)
+        sys.exit("创建软链接失败（已自动恢复原目录，未造成损失）:\n  %s\n  %s" % (ex, WIN_SYMLINK_HINT))
+    tgt = link_target(src)
+    if tgt is None or os.path.normpath(os.path.abspath(tgt)) != os.path.normpath(os.path.abspath(dest)):
+        remove_link(src)
+        os.rename(backup, src)
+        sys.exit("链接校验失败，已自动恢复原目录。")
+    plan.update(swapped=True, swapped_at=now_iso())
+    save_plan(plan)
+    print()
+    print("✓ 迁移完成！")
+    print("  %s 现为软链接 -> %s" % (src, dest))
+    print("  旧数据保留在备份: %s （观察数日稳定后请自行删除以释放空间）" % backup)
+    print("  回滚命令: python3 %s rollback --plan %s" % (os.path.abspath(__file__), plan["plan_path"]))
+    print("  现在可以重新打开 WorkBuddy 了。")
+
+
+def cmd_make_runner(args):
+    plan = load_plan(args.plan)
+    plan_rel = os.path.basename(plan["plan_path"])
+    os.makedirs(PLAN_DIR, exist_ok=True)
+    local_script = os.path.join(PLAN_DIR, "cache_mover.py")
+    shutil.copy2(os.path.abspath(__file__), local_script)
+    if os.name == "nt":
+        out = args.out or os.path.join(PLAN_DIR, "run_swap.bat")
+        lines = [
+            "@echo off",
+            "chcp 65001 >nul",
+            "echo WorkBuddy cache migration - phase 2 (swap).",
+            "echo Please make sure WorkBuddy has been QUIT before continuing.",
+            "pause",
+            'py -3 "%USERPROFILE%\\.wb-cache-move\\cache_mover.py" swap --plan "%USERPROFILE%\\.wb-cache-move\\%s"' % plan_rel,
+            'if errorlevel 9009 python "%USERPROFILE%\\.wb-cache-move\\cache_mover.py" swap --plan "%USERPROFILE%\\.wb-cache-move\\%s"' % plan_rel,
+            "echo.",
+            "pause",
+            "",
+        ]
+        content = "\r\n".join(lines)
+        if not content.isascii():
+            sys.exit("内部错误: bat 内容必须为 ASCII。")
+        with open(out, "w", encoding="ascii", newline="") as f:
+            f.write(content)
+    else:
+        out = args.out or os.path.join(PLAN_DIR, "run_swap.command")
+        content = "\n".join([
+            "#!/bin/bash",
+            "# WorkBuddy cache migration - phase 2 (swap).",
+            "# Quit WorkBuddy completely BEFORE running this.",
+            "",
+            'PY=""',
+            'for cand in "$(command -v python3)" "$(command -v python)" \\\n'
+            '         /opt/homebrew/bin/python3 /usr/local/bin/python3 \\\n'
+            '         "$HOME"/.workbuddy/binaries/python/versions/*/bin/python3; do',
+            '  if [ -x "$cand" ]; then PY="$cand"; break; fi',
+            "done",
+            'if [ -z "$PY" ]; then echo "python3 not found"; read -n 1 -s -r -p "Press any key to close..."; exit 1; fi',
+            "",
+            '"$PY" "$HOME/.wb-cache-move/cache_mover.py" swap --plan "$HOME/.wb-cache-move/%s"' % plan_rel,
+            'rc=$?',
+            'echo ""',
+            'if [ $rc -eq 0 ]; then echo "Done. You can start WorkBuddy again."; else echo "Failed with exit code $rc."; fi',
+            'read -n 1 -s -r -p "Press any key to close..."',
+            "",
+        ])
+        with open(out, "w", encoding="utf-8") as f:
+            f.write(content)
+        os.chmod(out, 0o755)
+    print("✓ 已生成独立运行脚本: %s" % out)
+    print("  操作序列：")
+    print("  1) 完全退出 WorkBuddy")
+    print("  2) 双击运行 %s （或在终端执行 bash %s）" % (out, out))
+    print("  3) 看到迁移完成提示后，重新打开 WorkBuddy")
+
+
+def cmd_rollback(args):
+    plan = load_plan(args.plan)
+    src, backup, dest = plan["src"], plan["backup"], plan["dest"]
+    if link_target(src) is None:
+        sys.exit("源路径不是软链接，无需回滚: " + src)
+    if not os.path.isdir(backup):
+        sys.exit("备份不存在: %s\n数据仍完整保留在迁移目标位置 %s，请人工处理。" % (backup, dest))
+    require_offline(args)
+    print("[1/2] 移除软链接: %s" % src)
+    remove_link(src)
+    if os.path.lexists(src):
+        sys.exit("移除软链接失败，原样保留，请人工检查。")
+    print("[2/2] 恢复备份: %s -> %s" % (backup, src))
+    os.rename(backup, src)
+    plan.update(swapped=False, rolled_back_at=now_iso())
+    save_plan(plan)
+    print()
+    print("✓ 已回滚，%s 恢复为真实目录。" % src)
+    print("  迁移出去的数据仍在 %s，确认不需要后可手动删除。" % dest)
+
+
+def cmd_status(args):
+    cmd_detect(args)
+
+
+def main():
+    _utf8_guard()
+    p = argparse.ArgumentParser(
+        description="WorkBuddy 缓存目录迁移工具（仅迁移 ~/.workbuddy，软链接接管原路径）",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__.split("子命令:")[1] if "子命令:" in __doc__ else None,
+    )
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    d = sub.add_parser("detect", help="查看 ~/.workbuddy 状态/体积分布/磁盘空间")
+    d.add_argument("--src", default=None)
+    d.set_defaults(func=cmd_detect)
+
+    c = sub.add_parser("copy", help="阶段1：复制数据到目标位置并校验（在线安全）")
+    c.add_argument("--dest-base", required=True, help="目标基准目录，将创建 <基准>/.workbuddy")
+    c.add_argument("--name", default=None, help="目标目录名（默认沿用源目录名）")
+    c.add_argument("--src", default=None, help="源目录（默认 ~/.workbuddy）")
+    c.add_argument("--force-any-dir", action="store_true", help="允许操作非默认目录（测试用）")
+    c.set_defaults(func=cmd_copy)
+
+    s = sub.add_parser("swap", help="阶段2：改名备份+创建软链接（须退出 WorkBuddy）")
+    s.add_argument("--plan", required=True, help="plan 文件路径，或 latest")
+    s.add_argument("--allow-app-running", action="store_true",
+                   help="跳过进程检测（仅当明确知晓风险时使用）")
+    s.set_defaults(func=cmd_swap)
+
+    m = sub.add_parser("make-runner", help="生成退出 WorkBuddy 后可双击运行的 swap 脚本")
+    m.add_argument("--plan", required=True, help="plan 文件路径，或 latest")
+    m.add_argument("--out", default=None, help="输出脚本路径")
+    m.set_defaults(func=cmd_make_runner)
+
+    r = sub.add_parser("rollback", help="回滚：移除软链接，恢复原目录")
+    r.add_argument("--plan", required=True, help="plan 文件路径，或 latest")
+    r.add_argument("--allow-app-running", action="store_true")
+    r.set_defaults(func=cmd_rollback)
+
+    st = sub.add_parser("status", help="等同 detect")
+    st.add_argument("--src", default=None)
+    st.set_defaults(func=cmd_status)
+
+    args = p.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
