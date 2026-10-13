@@ -866,8 +866,10 @@ def cmd_make_runner(args):
         out = args.out or os.path.join(PLAN_DIR, "run_%s.bat" % command)
         pre = ["@echo off", "chcp 65001 >nul"]
         py_lines = [
-            'py -3 "%USERPROFILE%\\.wb-cache-move\\cache_mover.py" %s' % invoke,
-            'if errorlevel 9009 python "%USERPROFILE%\\.wb-cache-move\\cache_mover.py" %s' % invoke,
+            # 注意：必须用拼接而非 % 格式化——模板里的 %USERPROFILE% 会被
+            # Python % 格式化当作非法转换符（ValueError: unsupported format character 'U'）
+            'py -3 "%USERPROFILE%\\.wb-cache-move\\cache_mover.py" ' + invoke,
+            'if errorlevel 9009 python "%USERPROFILE%\\.wb-cache-move\\cache_mover.py" ' + invoke,
         ]
         body = ["pause" if b == "pause" else "echo " + b for b in banner]
         content = "\r\n".join(pre + body + py_lines + ["echo.", "pause", ""])
