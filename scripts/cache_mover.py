@@ -15,7 +15,9 @@ WorkBuddy 缓存目录迁移工具（workbuddy-cache-mover）
   copy    --dest-base <dir>           阶段1（在线安全）：复制数据到目标并校验
   swap    --plan <plan.json>          阶段2（须退出 WorkBuddy）：改名备份+建软链接
   make-runner --plan <plan.json>      生成退出 WorkBuddy 后可双击运行的独立脚本
-  rollback --plan <plan.json>         回滚：移除软链接，恢复原目录
+  rollback --plan <plan.json>         仅回滚：移除软链接，恢复原目录（保留目标副本）
+  cleanup-backup --plan <plan.json>   迁移稳定后删除历史备份（默认移入废纸篓）
+  restore --plan <plan.json>          彻底恢复原状：回滚+删目标副本+清理全部痕迹
 
 仅使用标准库，无第三方依赖。Python >= 3.8。
 """
@@ -160,6 +162,45 @@ def remove_link(link_path):
             raise RuntimeError("rmdir junction 失败: %s%s" % ((r.stdout or "").strip(), (r.stderr or "").strip()))
         return
     raise RuntimeError("路径不是软链接/junction: " + link_path)
+
+
+def trash_path(path, hard=False):
+    """把目录移入系统废纸篓/回收站；hard=True 时永久删除。返回描述字符串。
+    这是"删除"操作的唯一推荐实现——个人文件永远先进废纸篓，可反悔。"""
+    if hard:
+        shutil.rmtree(path)
+        return "已永久删除: " + path
+    home = os.path.expanduser("~")
+    if sys.platform == "darwin":
+        trash_dir = os.path.join(home, ".Trash")
+        os.makedirs(trash_dir, exist_ok=True)
+        base = os.path.basename(os.path.abspath(path).rstrip(os.sep))
+        target = os.path.join(trash_dir, base)
+        i = 1
+        while os.path.lexists(target):
+            target = os.path.join(trash_dir, "%s %d" % (base, i))
+            i += 1
+        try:
+            os.rename(path, target)
+        except OSError:
+            shutil.move(path, target)  # 跨卷回退（复制+删除）
+        return "已移入废纸篓: " + target
+    if os.name == "nt":
+        ps = ("Add-Type -AssemblyName Microsoft.VisualBasic; "
+              "[Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory('%s',"
+              "'OnlyErrorDialogs','SendToRecycleBin')" % path.replace("'", "''"))
+        r = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                           capture_output=True, text=True, errors="replace")
+        if r.returncode == 0:
+            return "已移入回收站: " + path
+        raise RuntimeError("移入回收站失败(%s)。如确认要永久删除请加 --hard-delete" % ((r.stderr or "").strip()[:200]))
+    for tool, extra in (("gio", ["trash"]), ("trash-put", [])):
+        exe = shutil.which(tool)
+        if exe:
+            r = subprocess.run([exe] + extra + [path], capture_output=True, text=True)
+            if r.returncode == 0:
+                return "已移入系统回收站: " + path
+    raise RuntimeError("当前环境无回收站工具。如确认要永久删除请加 --hard-delete")
 
 
 def detect_app_running():
@@ -489,27 +530,31 @@ def cmd_swap(args):
     print()
     print("✓ 迁移完成！")
     print("  %s 现为软链接 -> %s" % (src, dest))
-    print("  旧数据保留在备份: %s （观察数日稳定后请自行删除以释放空间）" % backup)
-    print("  回滚命令: python3 %s rollback --plan %s" % (os.path.abspath(__file__), plan["plan_path"]))
+    print("  旧数据保留在备份: %s" % backup)
+    print("  确认应用稳定运行数日后，可清理备份释放空间:")
+    print("    python3 %s cleanup-backup --plan %s --yes" % (os.path.abspath(__file__), plan["plan_path"]))
+    print("  如需回滚（保留迁移副本）: python3 %s rollback --plan %s" % (os.path.abspath(__file__), plan["plan_path"]))
+    print("  如需彻底恢复原状: python3 %s restore --plan %s" % (os.path.abspath(__file__), plan["plan_path"]))
     print("  现在可以重新打开 WorkBuddy 了。")
 
 
 def cmd_make_runner(args):
     plan = load_plan(args.plan)
     plan_rel = os.path.basename(plan["plan_path"])
+    command = getattr(args, "command", "swap") or "swap"
     os.makedirs(PLAN_DIR, exist_ok=True)
     local_script = os.path.join(PLAN_DIR, "cache_mover.py")
     shutil.copy2(os.path.abspath(__file__), local_script)
     if os.name == "nt":
-        out = args.out or os.path.join(PLAN_DIR, "run_swap.bat")
+        out = args.out or os.path.join(PLAN_DIR, "run_%s.bat" % command)
         lines = [
             "@echo off",
             "chcp 65001 >nul",
-            "echo WorkBuddy cache migration - phase 2 (swap).",
+            "echo WorkBuddy cache migration - phase 2 (%s)." % command,
             "echo Please make sure WorkBuddy has been QUIT before continuing.",
             "pause",
-            'py -3 "%USERPROFILE%\\.wb-cache-move\\cache_mover.py" swap --plan "%USERPROFILE%\\.wb-cache-move\\%s"' % plan_rel,
-            'if errorlevel 9009 python "%USERPROFILE%\\.wb-cache-move\\cache_mover.py" swap --plan "%USERPROFILE%\\.wb-cache-move\\%s"' % plan_rel,
+            'py -3 "%USERPROFILE%\\.wb-cache-move\\cache_mover.py" %s --plan "%USERPROFILE%\\.wb-cache-move\\%s"' % (command, plan_rel),
+            'if errorlevel 9009 python "%USERPROFILE%\\.wb-cache-move\\cache_mover.py" %s --plan "%USERPROFILE%\\.wb-cache-move\\%s"' % (command, plan_rel),
             "echo.",
             "pause",
             "",
@@ -520,10 +565,10 @@ def cmd_make_runner(args):
         with open(out, "w", encoding="ascii", newline="") as f:
             f.write(content)
     else:
-        out = args.out or os.path.join(PLAN_DIR, "run_swap.command")
+        out = args.out or os.path.join(PLAN_DIR, "run_%s.command" % command)
         content = "\n".join([
             "#!/bin/bash",
-            "# WorkBuddy cache migration - phase 2 (swap).",
+            "# WorkBuddy cache migration - phase 2 (%s)." % command,
             "# Quit WorkBuddy completely BEFORE running this.",
             "",
             'PY=""',
@@ -534,7 +579,7 @@ def cmd_make_runner(args):
             "done",
             'if [ -z "$PY" ]; then echo "python3 not found"; read -n 1 -s -r -p "Press any key to close..."; exit 1; fi',
             "",
-            '"$PY" "$HOME/.wb-cache-move/cache_mover.py" swap --plan "$HOME/.wb-cache-move/%s"' % plan_rel,
+            '"$PY" "$HOME/.wb-cache-move/cache_mover.py" %s --plan "$HOME/.wb-cache-move/%s"' % (command, plan_rel),
             'rc=$?',
             'echo ""',
             'if [ $rc -eq 0 ]; then echo "Done. You can start WorkBuddy again."; else echo "Failed with exit code $rc."; fi',
@@ -548,7 +593,7 @@ def cmd_make_runner(args):
     print("  操作序列：")
     print("  1) 完全退出 WorkBuddy")
     print("  2) 双击运行 %s （或在终端执行 bash %s）" % (out, out))
-    print("  3) 看到迁移完成提示后，重新打开 WorkBuddy")
+    print("  3) 看到完成提示后，重新打开 WorkBuddy")
 
 
 def cmd_rollback(args):
@@ -570,6 +615,90 @@ def cmd_rollback(args):
     print()
     print("✓ 已回滚，%s 恢复为真实目录。" % src)
     print("  迁移出去的数据仍在 %s，确认不需要后可手动删除。" % dest)
+
+
+def cmd_cleanup_backup(args):
+    """用户主动发起的动作一：迁移稳定后删除原地的历史缓存备份。
+    默认移入系统废纸篓（可反悔），需 --yes 显式确认。"""
+    plan = load_plan(args.plan)
+    src, dest, backup = plan["src"], plan["dest"], plan["backup"]
+    if plan.get("backup_removed"):
+        print("备份此前已删除(%s)，无需重复操作。" % plan.get("backup_removed_at", ""))
+        return
+    cur = link_target(src)
+    if cur is None or os.path.normpath(os.path.abspath(cur)) != os.path.normpath(os.path.abspath(dest)):
+        sys.exit(
+            "当前源路径不是指向迁移目标的软链接，状态与 plan 不符，拒绝删除备份。\n"
+            "  src=%s\n  当前链接目标=%s\n  plan 目标=%s" % (src, cur, dest))
+    if not os.path.isdir(backup):
+        print("备份目录不存在（可能已手动删除）: %s" % backup)
+        plan.update(backup_removed=True, backup_removed_at=now_iso())
+        save_plan(plan)
+        return
+    b_bytes, b_files, _ = tree_stats(backup)
+    print("待清理的迁移备份: %s (%s, %d 个文件)" % (backup, fmt_bytes(b_bytes), b_files))
+    print("删除后 rollback/restore 将不可用（数据仍在迁移目标 %s）。" % dest)
+    if not args.yes:
+        sys.exit("未确认。请与用户明确确认后加 --yes 执行。")
+    msg = trash_path(backup, hard=args.hard_delete)
+    plan.update(backup_removed=True, backup_removed_at=now_iso(), backup_removed_how=msg)
+    save_plan(plan)
+    print()
+    print("✓ 备份清理完成: " + msg)
+
+
+def cmd_restore(args):
+    """用户主动发起的动作二：彻底恢复原状。
+    移除软链接 → 备份恢复为原目录 → 目标副本移入废纸篓 → 清理 plan/runner 痕迹。
+    与 rollback 的区别：rollback 只恢复原目录、保留目标副本与 plan，便于再次迁移。"""
+    plan = load_plan(args.plan)
+    src, dest, backup = plan["src"], plan["dest"], plan["backup"]
+    cur = link_target(src)
+    if cur is None and os.path.isdir(src):
+        print("源路径已是真实目录（此前已回滚），跳过恢复步骤。")
+    elif cur is None:
+        sys.exit("源路径既不是软链接也不是目录: %s，请人工检查。" % src)
+    else:
+        if not os.path.isdir(backup):
+            sys.exit(
+                "备份不存在，无法安全恢复原状: %s\n"
+                "当前数据只在迁移目标 %s。若要恢复，请人工把目标目录改名/移动回原路径。" % (backup, dest))
+        if os.path.normpath(os.path.abspath(cur)) != os.path.normpath(os.path.abspath(dest)):
+            sys.exit("软链接指向 %s 与 plan 目标 %s 不符，请人工检查。" % (cur, dest))
+        require_offline(args)
+        print("[1/4] 移除软链接: %s" % src)
+        remove_link(src)
+        if os.path.lexists(src):
+            sys.exit("移除软链接失败，原样保留，请人工检查。")
+        print("[2/4] 恢复备份为原目录: %s -> %s" % (backup, src))
+        os.rename(backup, src)
+        plan.update(swapped=False, restored_at=now_iso())
+        save_plan(plan)
+    if args.keep_target:
+        print("[3/4] 按要求保留迁移目标副本: %s" % dest)
+    elif os.path.isdir(dest):
+        print("[3/4] 迁移目标副本移入废纸篓: %s (%s)" % (dest, fmt_bytes(tree_stats(dest)[0])))
+        msg = trash_path(dest, hard=args.hard_delete)
+        print("      " + msg)
+    else:
+        print("[3/4] 迁移目标副本不存在，跳过: %s" % dest)
+    print("[4/4] 清理 plan 与 runner 文件 ...")
+    removed = []
+    for f in ("run_swap.command", "run_swap.bat",
+              "run_restore.command", "run_restore.bat",
+              "cache_mover.py", os.path.basename(plan["plan_path"])):
+        fp = os.path.join(PLAN_DIR, f)
+        if os.path.lexists(fp):
+            os.remove(fp)
+            removed.append(f)
+    try:
+        os.rmdir(PLAN_DIR)
+        removed.append(PLAN_DIR + " 目录")
+    except OSError:
+        pass
+    print("      已清理: %s" % ("、".join(removed) if removed else "无"))
+    print()
+    print("✓ 已恢复原状：%s 为真实目录，迁移副本与痕迹已清理。" % src)
 
 
 def cmd_status(args):
@@ -602,15 +731,30 @@ def main():
                    help="跳过进程检测（仅当明确知晓风险时使用）")
     s.set_defaults(func=cmd_swap)
 
-    m = sub.add_parser("make-runner", help="生成退出 WorkBuddy 后可双击运行的 swap 脚本")
+    m = sub.add_parser("make-runner", help="生成退出 WorkBuddy 后可双击运行的离线脚本（swap/restore）")
     m.add_argument("--plan", required=True, help="plan 文件路径，或 latest")
+    m.add_argument("--command", choices=["swap", "restore"], default="swap",
+                   help="生成哪种动作的 runner（默认 swap）")
     m.add_argument("--out", default=None, help="输出脚本路径")
     m.set_defaults(func=cmd_make_runner)
 
-    r = sub.add_parser("rollback", help="回滚：移除软链接，恢复原目录")
+    r = sub.add_parser("rollback", help="仅回滚：移除软链接，恢复原目录（保留目标副本）")
     r.add_argument("--plan", required=True, help="plan 文件路径，或 latest")
     r.add_argument("--allow-app-running", action="store_true")
     r.set_defaults(func=cmd_rollback)
+
+    cb = sub.add_parser("cleanup-backup", help="迁移稳定后清理历史备份（默认移入废纸篓，需 --yes）")
+    cb.add_argument("--plan", required=True, help="plan 文件路径，或 latest")
+    cb.add_argument("--yes", action="store_true", help="确认清理（与用户确认后传入）")
+    cb.add_argument("--hard-delete", action="store_true", help="不进废纸篓，永久删除（不建议）")
+    cb.set_defaults(func=cmd_cleanup_backup)
+
+    rs = sub.add_parser("restore", help="彻底恢复原状：回滚+删除迁移副本+清理全部痕迹")
+    rs.add_argument("--plan", required=True, help="plan 文件路径，或 latest")
+    rs.add_argument("--keep-target", action="store_true", help="保留迁移目标副本，仅恢复原目录")
+    rs.add_argument("--hard-delete", action="store_true", help="副本不进废纸篓，永久删除")
+    rs.add_argument("--allow-app-running", action="store_true")
+    rs.set_defaults(func=cmd_restore)
 
     st = sub.add_parser("status", help="等同 detect")
     st.add_argument("--src", default=None)
