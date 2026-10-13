@@ -970,6 +970,7 @@ def restore_data(args, full):
         save_plan(old)
         transition(plan, 'cleanup')
         try:
+            assert_offline()
             with Progress('[5/6] 清理旧位置副本'):
                 print(trash_path(dest), flush=True)
         except Exception as ex:
@@ -1022,7 +1023,7 @@ def cmd_recover(args):
     src, dest, data = plan['src'], plan['dest'], plan.get('data', plan['dest'])
     if plan.get('version', 1) < 2:
         raise SafeAbort('旧记录没有阶段信息，请先 detect；不能自动推断中断状态。')
-    auto_manage_app(args)
+    relaunch = auto_manage_app(args)
     target = resolved_link(src)
     stage = plan.get('stage')
     if plan['action'] == 'migrate':
@@ -1030,6 +1031,8 @@ def cmd_recover(args):
             transition(plan, 'complete', swapped=True, source_usable=True,
                        warnings=['中断后已确认链接与新数据位置；旧副本保留，需检查后清理。'])
             warn('已确认迁移切换完成；旧副本保留。请检查应用后清理。')
+            if relaunch and not args.no_relaunch:
+                relaunch_apps(relaunch)
             return
         if not os.path.lexists(src):
             if plan.get('old_target') and os.path.isdir(data):
@@ -1043,6 +1046,8 @@ def cmd_recover(args):
             transition(plan, 'aborted', swapped=False, source_usable=True,
                        published=bool(plan.get('verified') and os.path.isdir(dest)))
             print('原路径已恢复可用，临时副本保留。可重新执行迁移。', flush=True)
+            if relaunch and not args.no_relaunch:
+                relaunch_apps(relaunch)
             return
     else:
         if not os.path.lexists(src) and os.path.isdir(data):
@@ -1051,11 +1056,15 @@ def cmd_recover(args):
         if target and same_path(target, data) and os.path.isdir(src):
             transition(plan, 'aborted', source_usable=True)
             print('原链接已恢复；最新数据仍在原实际位置，可重新执行恢复。', flush=True)
+            if relaunch and not args.no_relaunch:
+                relaunch_apps(relaunch)
             return
         if resolved_link(src) is None and os.path.isdir(src) and stage in ('switching', 'committed', 'cleanup'):
             if plan.get('source_digest') and manifest_digest(manifest(src, hashes=True, label='核对已恢复数据')) == plan['source_digest']:
                 transition(plan, 'complete', swapped=False, source_usable=True)
                 warn('已确认恢复完成；旧位置副本保留。')
+                if relaunch and not args.no_relaunch:
+                    relaunch_apps(relaunch)
                 return
     raise RecoveryRequired('当前目录状态与记录无法确定对应关系。已保留全部数据，请人工检查；不要删除副本。')
 
@@ -1212,7 +1221,7 @@ def windows_runner_content(job_name):
     return '\r\n'.join([
         '@echo off', 'setlocal DisableDelayedExpansion',
         'if /I "%~1"=="--console" goto run',
-        '"%ComSpec%" /D /V:OFF /K ""%~f0" --console"', 'exit /b', ':run',
+        '"%ComSpec%" /D /S /V:OFF /K ""%~f0" --console"', 'exit /b', ':run',
         'chcp 65001 >nul', 'title WorkBuddy cache mover',
         'echo Preparing. Do not reopen WorkBuddy during the operation.',
         'set "PYEXE="', 'set "PYFLAG="',

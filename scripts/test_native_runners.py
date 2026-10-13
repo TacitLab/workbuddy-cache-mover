@@ -56,7 +56,7 @@ class NativeRunnerTests(unittest.TestCase):
             path = os.path.join(folder, 'run.bat')
             with open(path, 'w', encoding='ascii', newline='') as f:
                 f.write(m.windows_runner_content('broken.json'))
-            command = '"%s" /D /V:OFF /C ""%s""' % (os.environ['COMSPEC'], path)
+            command = '"%s" /D /S /V:OFF /C ""%s""' % (os.environ['COMSPEC'], path)
             process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                        stderr=subprocess.STDOUT, text=True, encoding='utf-8',
                                        errors='replace', env=env, bufsize=1)
@@ -84,6 +84,9 @@ class NativeRunnerTests(unittest.TestCase):
                 if process.poll() is None:
                     subprocess.run(['taskkill', '/PID', str(process.pid), '/T', '/F'], capture_output=True)
                     process.wait(timeout=10)
+                reader.join(timeout=2)
+                process.stdin.close()
+                process.stdout.close()
 
 
 if __name__ == '__main__':
