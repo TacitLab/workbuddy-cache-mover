@@ -864,14 +864,28 @@ def cmd_make_runner(args):
         ]
     if os.name == "nt":
         out = args.out or os.path.join(PLAN_DIR, "run_%s.bat" % command)
-        pre = ["@echo off", "chcp 65001 >nul"]
-        py_lines = [
-            # 注意：必须用拼接而非 % 格式化——模板里的 %USERPROFILE% 会被
-            # Python % 格式化当作非法转换符（ValueError: unsupported format character 'U'）
-            'py -3 "%USERPROFILE%\\.wb-cache-move\\cache_mover.py" ' + invoke,
-            'if errorlevel 9009 python "%USERPROFILE%\\.wb-cache-move\\cache_mover.py" ' + invoke,
+        # 解释器探测链：py 启动器 → PATH 里的 python → WorkBuddy 自带 Python。
+        # 注意：bat 内容全部用字符串拼接生成——模板里的 %USERPROFILE%/%%F 等
+        # 会被 Python % 格式化当作非法转换符（ValueError: unsupported format character）
+        pre = [
+            "@echo off",
+            "chcp 65001 >nul",
+            'set "PYEXE="',
+            "where py >nul 2>&1 && set \"PYEXE=py\"",
+            "if not defined PYEXE where python >nul 2>&1 && set \"PYEXE=python\"",
+            'if not defined PYEXE for %%F in ("%USERPROFILE%\\.workbuddy\\binaries\\python\\versions\\*\\python.exe") do if not defined PYEXE set "PYEXE=%%~fF"',
+            "if not defined PYEXE (",
+            "    echo ERROR: Python not found.",
+            "    echo Install Python 3.8+ from python.org or Microsoft Store, or reinstall WorkBuddy,",
+            "    echo then run this script again.",
+            "    pause",
+            "    exit /b 1",
+            ")",
         ]
         body = ["pause" if b == "pause" else "echo " + b for b in banner]
+        py_lines = [
+            '"%PYEXE%" "%USERPROFILE%\\.wb-cache-move\\cache_mover.py" ' + invoke,
+        ]
         content = "\r\n".join(pre + body + py_lines + ["echo.", "pause", ""])
         if not content.isascii():
             sys.exit("内部错误: bat 内容必须为 ASCII。")
