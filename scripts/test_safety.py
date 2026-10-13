@@ -241,6 +241,24 @@ except m.BusyError: sys.exit(4)
         self.assertIsNone(m.resolved_link(self.src))
         self.assertTrue(os.path.isfile(os.path.join(self.src, 'latest')))
 
+    def test_restore_cleans_verified_snapshots_from_previous_moves(self):
+        first = self.migrate()
+        with open(os.path.join(self.src, 'latest'), 'w') as f:
+            f.write('latest')
+        second = os.path.join(self.root, 'second')
+        m.cmd_migrate(self.migrate_args(dest_base=second))
+        with mock.patch.object(m, 'trash_path', side_effect=self.fake_trash):
+            m.cmd_restore(self.restore_args(keep_backup=False))
+        self.assertFalse(os.path.exists(first['backup']))
+        self.assertFalse(os.path.exists(self.dest))
+        self.assertTrue(os.path.isfile(os.path.join(self.src, 'latest')))
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX directory permissions')
+    def test_root_private_permissions_are_preserved(self):
+        os.chmod(self.src, 0o700)
+        self.migrate()
+        self.assertEqual(os.stat(self.dest).st_mode & 0o777, 0o700)
+
     def test_cleanup_failure_is_completed_with_warnings(self):
         with mock.patch.object(m, 'trash_path', side_effect=OSError('trash denied')):
             rc = m.execute_logged(lambda: m.cmd_migrate(self.migrate_args(keep_backup=False)), os.path.join(self.root, 'logs'))

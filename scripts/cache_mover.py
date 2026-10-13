@@ -412,9 +412,10 @@ def identity(path):
 
 def manifest(path, hashes=False, label='扫描目录'):
     """不跟随目录链接；目录、链接、内容均纳入校验，读取失败一律报错。"""
-    out = {}
     if not os.path.isdir(path):
         raise SafeAbort('数据目录不可访问: ' + path)
+    root_stat = os.stat(path)
+    out = {'.': {'kind': 'dir', 'mode': statmod.S_IMODE(root_stat.st_mode), 'signature': signature(root_stat)}}
     with Progress(label) as progress:
         def visit(folder):
             with os.scandir(folder) as iterator:
@@ -476,7 +477,7 @@ def run_copy(src, dest):
     """通用流式复制，四个平台采用相同计数与校验语义，无外部复制工具依赖。"""
     records = manifest(src, label='[2/6] 扫描待复制数据')
     total = sum(r.get('size', 0) for r in records.values())
-    os.makedirs(dest, exist_ok=True)
+    os.makedirs(dest, mode=0o700, exist_ok=True)
     # 调用方只传入本工具创建并记录的 staging；清理上次中断的多余副本条目。
     previous = manifest(dest, label='检查临时副本')
     for rel, record in sorted(previous.items(), key=lambda item: item[0].count(os.sep)):
@@ -494,10 +495,10 @@ def run_copy(src, dest):
     with Progress('[2/6] 正在复制', total, len(records)) as progress:
         for rel, record in sorted(records.items(), key=lambda item: (item[0].count(os.sep), item[0])):
             s, d = os.path.join(src, rel), os.path.join(dest, rel)
-            os.makedirs(os.path.dirname(d), exist_ok=True)
+            os.makedirs(os.path.dirname(d), mode=0o700, exist_ok=True)
             kind = record['kind']
             if kind == 'dir':
-                os.makedirs(d, exist_ok=True)
+                os.makedirs(d, mode=0o700, exist_ok=True)
             elif kind in ('link', 'junction'):
                 if os.path.lexists(d):
                     if link_target(d) is None:
@@ -529,7 +530,7 @@ def run_copy(src, dest):
                     if os.path.exists(temporary):
                         os.unlink(temporary)
             progress.update(count=1)
-        for rel, record in sorted(records.items(), key=lambda item: item[0].count(os.sep), reverse=True):
+        for rel, record in sorted(records.items(), key=lambda item: -1 if item[0] == '.' else item[0].count(os.sep), reverse=True):
             if record['kind'] == 'dir':
                 shutil.copystat(os.path.join(src, rel), os.path.join(dest, rel), follow_symlinks=False)
     return 'python-stream'
@@ -975,14 +976,25 @@ def restore_data(args, full):
                 print(trash_path(dest), flush=True)
         except Exception as ex:
             warn('数据已恢复，旧位置副本清理失败，保留在 %s: %s' % (dest, ex))
-        if full and not getattr(args, 'keep_backup', False) and os.path.isdir(old['backup']):
-            try:
-                if not old.get('source_digest') or manifest_digest(manifest(old['backup'], hashes=True, label='确认旧快照身份')) != old['source_digest']:
-                    raise SafeAbort('旧快照身份无法确认或内容已变化，保留供人工检查。')
-                with Progress('[5/6] 清理旧快照'):
-                    print(trash_path(old['backup'], hard=getattr(args, 'hard_delete', False)), flush=True)
-            except Exception as ex:
-                warn('旧快照清理失败，已保留: ' + str(ex))
+        if full and not getattr(args, 'keep_backup', False):
+            # 历次二次搬迁可能保留多个旧副本，只清理该源路径的可核实快照。
+            snapshots = {old['backup']: old.get('source_digest')}
+            for filename in sorted(glob.glob(os.path.join(PLAN_DIR, 'plan-*.json'))):
+                history = load_plan(filename)
+                if history.get('action') == 'migrate' and os.path.normcase(history['src']) == os.path.normcase(src):
+                    for path in (history['backup'], history.get('old_target')):
+                        if path and os.path.isdir(path) and not same_path(path, src):
+                            snapshots[path] = history.get('source_digest')
+            for path, digest in snapshots.items():
+                if not os.path.isdir(path):
+                    continue
+                try:
+                    if not digest or manifest_digest(manifest(path, hashes=True, label='确认旧快照身份')) != digest:
+                        raise SafeAbort('旧快照身份无法确认或内容已变化，保留供人工检查: ' + path)
+                    with Progress('[5/6] 清理旧快照'):
+                        print(trash_path(path, hard=getattr(args, 'hard_delete', False)), flush=True)
+                except Exception as ex:
+                    warn('旧快照清理失败，已保留: ' + str(ex))
         if relaunch and not args.no_relaunch:
             relaunch_apps(relaunch)
         if full:
