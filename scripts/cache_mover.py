@@ -21,8 +21,6 @@ WorkBuddy 缓存目录迁移工具（workbuddy-cache-mover）
   restore --plan <plan.json>          彻底恢复原状：当前数据迁回原位+清旧快照+清痕迹
                                       （恢复数据源=软链接指向的当前实际位置，绝不用
                                       旧快照，迁移期间的变更零丢失）
-  copy / swap                         旧版两阶段分步模式（不推荐：在线复制会遇到
-                                      文件锁与文件持续变化的问题，仅保留作兼容）
 
 仅使用标准库，无第三方依赖。Python >= 3.8。
 """
@@ -386,27 +384,11 @@ def run_copy(src, dest):
     return "pycopy"
 
 
-def verify_copy(src, dest):
-    """校验 dest 覆盖了 src 的所有文件。运行中的应用持续写入少量新文件属正常，
-    允许 <=10 个且合计 <5MB 的缺口（记录 warning）。"""
-    s = relative_file_set(src)
-    d = relative_file_set(dest)
-    missing = {k: v for k, v in s.items() if k not in d}
-    missing_bytes = sum(missing.values())
-    warning = None
-    if missing:
-        if len(missing) <= 10 and missing_bytes < 5 * 1024 * 1024:
-            warning = "%d 个运行中新写入的小文件(%s)未及同步，已按可接受漂移忽略。" % (
-                len(missing), fmt_bytes(missing_bytes))
-            return True, missing, warning
-        return False, missing, None
-    return True, missing, warning
 
 
 def verify_strict(src, dest):
     """源目录静止状态下的严格校验：文件清单与大小必须逐项一致（migrate 用）。
-    与 verify_copy 的区别：copy 在线时源在变化，只能容忍漂移；migrate 关闭了
-    所有写入方，任何不一致都视为失败。"""
+    源目录静止（应用已关闭），任何不一致都视为失败。"""
     s = relative_file_set(src)
     d = relative_file_set(dest)
     missing = {k: v for k, v in s.items() if k not in d}
@@ -542,58 +524,6 @@ def home_of(path):
     return os.path.expanduser("~")
 
 
-def cmd_copy(args):
-    src = resolve_src(args.src, args.force_any_dir)
-    guard_common(src)
-    if link_target(src) is not None:
-        sys.exit("源目录已是软链接(-> %s)，无需再迁移；如需换位置请先 rollback。" % link_target(src))
-    if not os.path.isdir(src):
-        sys.exit("源目录不存在: " + src)
-    dest_base = os.path.abspath(os.path.expanduser(args.dest_base))
-    dest = os.path.join(dest_base, args.name or os.path.basename(src))
-    if is_within(src, dest) or is_within(dest, src):
-        sys.exit("目标位置与源目录存在嵌套关系，拒绝执行。\n  src=%s\n  dest=%s" % (src, dest))
-    src_bytes, src_files, _ = tree_stats(src)
-    os.makedirs(dest_base, exist_ok=True)
-    free = shutil.disk_usage(dest_base).free
-    if free < src_bytes * 1.02:
-        sys.exit(
-            "目标卷剩余空间不足: 需要约 %s（含2%余量），目标卷 %s 仅剩 %s。" % (
-                fmt_bytes(src_bytes), dest_base, fmt_bytes(free)))
-    print("[1/3] 复制 %s (%s, %d 个文件)" % (src, fmt_bytes(src_bytes), src_files))
-    print("      -> %s （视磁盘速度可能需要数分钟）" % dest)
-    method = run_copy(src, dest)
-    print("[2/3] 增量二次同步，收敛运行中新增文件 ... (%s)" % method)
-    run_copy(src, dest)
-    print("[3/3] 校验完整性 ...")
-    ok, missing, warning = verify_copy(src, dest)
-    if not ok:
-        print("校验失败：%d 个文件未复制到目标(合计 %s)，不生成 plan，禁止 swap。" % (
-            len(missing), fmt_bytes(sum(missing.values()))))
-        for k in sorted(missing)[:10]:
-            print("  - " + k)
-        sys.exit(1)
-    if warning:
-        print("警告: " + warning)
-    plan = {
-        "version": 1,
-        "created_at": now_iso(),
-        "platform": "%s/%s" % (os.name, sys.platform),
-        "src": src,
-        "dest": dest,
-        "backup": src + BACKUP_SUFFIX,
-        "src_bytes": src_bytes,
-        "src_files": src_files,
-        "verified": True,
-        "swapped": False,
-    }
-    path = write_plan(plan)
-    print()
-    print("✓ 复制与校验完成，plan 已写入: %s" % path)
-    print("  下一步（必须先完全退出 WorkBuddy）:")
-    print("    python3 %s swap --plan %s" % (os.path.abspath(__file__), path))
-    print("  若在 WorkBuddy 内操作，用 make-runner 生成退出后可双击运行的脚本:")
-    print("    python3 %s make-runner --plan %s" % (os.path.abspath(__file__), path))
 
 
 def _cmd_redirect(args, src, cur):
@@ -896,58 +826,11 @@ def require_offline(args):
         print()
         print("为避免数据竞争，本阶段必须在完全退出 WorkBuddy 的环境执行。")
         print("推荐使用一键流程：make-runner --dest-base <目录>（自动关闭/重启 WorkBuddy）。")
-        print("在 WorkBuddy 会话内直接执行 swap 会被拒绝（exit code 3），这是设计行为。")
+        print("在 WorkBuddy 会话内直接执行会被拒绝（exit code 3），这是设计行为。")
         sys.exit(3)
     return state
 
 
-def cmd_swap(args):
-    plan = load_plan(args.plan)
-    src, dest, backup = plan["src"], plan["dest"], plan["backup"]
-    if not plan.get("verified"):
-        sys.exit("该 plan 未通过校验，请重新执行 copy。")
-    cur = link_target(src)
-    if cur is not None:
-        if os.path.normpath(os.path.abspath(cur)) == os.path.normpath(os.path.abspath(dest)):
-            print("已迁移完成，无需重复操作：%s -> %s" % (src, dest))
-            return
-        sys.exit("源路径已是软链接但指向 %s，与 plan 目标 %s 不一致，请人工检查。" % (cur, dest))
-    if not os.path.isdir(dest):
-        sys.exit("目标目录不存在(是否被移动/删除?): " + dest)
-    if os.path.exists(backup):
-        sys.exit("备份路径已存在，请先处理: " + backup)
-    require_offline(args)
-    print("[1/3] 最终增量同步 ...")
-    run_copy(src, dest)
-    ok, missing, warning = verify_copy(src, dest)
-    if not ok:
-        sys.exit("最终校验失败: %d 个文件缺失(合计 %s)。" % (len(missing), fmt_bytes(sum(missing.values()))))
-    if warning:
-        print("警告: " + warning)
-    print("[2/3] 原目录改名备份: %s -> %s" % (src, backup))
-    os.rename(src, backup)
-    print("[3/3] 创建软链接: %s -> %s" % (src, dest))
-    try:
-        make_link(dest, src)
-    except Exception as ex:
-        os.rename(backup, src)
-        sys.exit("创建软链接失败（已自动恢复原目录，未造成损失）:\n  %s\n  %s" % (ex, WIN_SYMLINK_HINT))
-    tgt = link_target(src)
-    if tgt is None or os.path.normpath(os.path.abspath(tgt)) != os.path.normpath(os.path.abspath(dest)):
-        remove_link(src)
-        os.rename(backup, src)
-        sys.exit("链接校验失败，已自动恢复原目录。")
-    plan.update(swapped=True, swapped_at=now_iso())
-    save_plan(plan)
-    print()
-    print("✓ 迁移完成！")
-    print("  %s 现为软链接 -> %s" % (src, dest))
-    print("  旧数据保留在备份: %s" % backup)
-    print("  确认应用稳定运行数日后，可清理备份释放空间:")
-    print("    python3 %s cleanup-backup --plan %s --yes" % (os.path.abspath(__file__), plan["plan_path"]))
-    print("  如需回滚（保留迁移副本）: python3 %s rollback --plan %s" % (os.path.abspath(__file__), plan["plan_path"]))
-    print("  如需彻底恢复原状: python3 %s restore --plan %s" % (os.path.abspath(__file__), plan["plan_path"]))
-    print("  现在可以重新打开 WorkBuddy 了。")
 
 
 def cmd_make_runner(args):
@@ -997,7 +880,7 @@ def cmd_make_runner(args):
         banner_lines = ["#!/bin/bash"]
         for b in banner:
             banner_lines.append("# " + b if b == "pause" or b.startswith(("WorkBuddy", "Please")) else b)
-        # pause 仅用于 swap/restore 模式：等待用户确认已退出应用
+        # pause 仅用于 restore 模式：等待用户确认已退出应用
         pause_lines = ['read -n 1 -s -r -p "Press any key to start..."'] if "pause" in banner else []
         content = "\n".join(banner_lines + [""] + [
             'PY=""',
@@ -1235,22 +1118,9 @@ def main():
                     help="迁移后保留原始数据（默认自动移入废纸篓）")
     mg.set_defaults(func=cmd_migrate)
 
-    c = sub.add_parser("copy", help="旧版阶段1：在线复制（不推荐，遇文件锁/文件变化；建议用 migrate）")
-    c.add_argument("--dest-base", required=True, help="目标基准目录，将创建 <基准>/.workbuddy")
-    c.add_argument("--name", default=None, help="目标目录名（默认沿用源目录名）")
-    c.add_argument("--src", default=None, help="源目录（默认 ~/.workbuddy）")
-    c.add_argument("--force-any-dir", action="store_true", help="允许操作非默认目录（测试用）")
-    c.set_defaults(func=cmd_copy)
-
-    s = sub.add_parser("swap", help="旧版阶段2：改名备份+创建软链接（不推荐，建议用 migrate）")
-    s.add_argument("--plan", required=True, help="plan 文件路径，或 latest")
-    s.add_argument("--allow-app-running", action="store_true",
-                   help="跳过进程检测（仅当明确知晓风险时使用）")
-    s.set_defaults(func=cmd_swap)
-
     m = sub.add_parser("make-runner", help="生成可双击运行的独立脚本（默认一键 migrate 模式）")
-    m.add_argument("--command", choices=["migrate", "swap", "restore"], default="migrate",
-                   help="生成哪种动作的 runner（默认 migrate 一键模式）")
+    m.add_argument("--command", choices=["migrate", "restore"], default="migrate",
+                   help="生成哪种动作的 runner（默认 migrate；restore 恢复原状用）")
     m.add_argument("--dest-base", default=None, help="migrate 模式的目标基准目录")
     m.add_argument("--name", default=None, help="migrate 模式的目标目录名")
     m.add_argument("--plan", default="latest", help="swap/restore 模式使用的 plan（默认 latest）")

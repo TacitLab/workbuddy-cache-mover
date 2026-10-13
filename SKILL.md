@@ -139,12 +139,6 @@ python3 $SCRIPT make-runner --command restore
 python3 $SCRIPT rollback --plan <plan路径>
 ```
 
-## 旧版两阶段模式（copy + swap，不推荐）
-
-`copy`（在线复制）+ `swap`（离线改名+建链）仍保留作兼容，但**不要再使用**：
-WorkBuddy 运行时复制会遇到文件锁报错、文件持续增长导致副本过期。仅当用户明确理解
-风险并要求时使用。当前主流程是 migrate 一键模式。
-
 ## 常见问题
 
 | 现象 | 说明 |
