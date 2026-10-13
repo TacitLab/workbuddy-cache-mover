@@ -38,6 +38,7 @@ import stat as statmod
 import subprocess
 import sys
 import time
+import traceback
 
 DEFAULT_SRC = os.path.join(os.path.expanduser("~"), ".workbuddy")
 PLAN_DIR = os.path.join(os.path.expanduser("~"), ".wb-cache-move")
@@ -354,10 +355,14 @@ def run_copy(src, dest):
             raise RuntimeError("rsync 失败(退出码 %d): %s" % (r.returncode, (r.stderr or "")[:500]))
         return "rsync"
     if os.name == "nt":
-        rc = subprocess.call([
+        proc = subprocess.Popen([
             "robocopy", src, dest,
             "/E", "/COPY:DAT", "/DCOPY:DAT", "/R:2", "/W:1", "/NFL", "/NDL", "/NP",
-        ])
+        ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, errors="replace")
+        for line in proc.stdout:
+            print(line, end="", flush=True)
+        rc = proc.wait()
         if rc >= 8:
             raise RuntimeError("robocopy 失败，退出码 %d" % rc)
         return "robocopy"
@@ -833,16 +838,132 @@ def require_offline(args):
 
 
 
+class _LogStream:
+    """同步显示并落盘；不关闭原始终端流。"""
+    def __init__(self, console, log):
+        self.console, self.log = console, log
+
+    def write(self, text):
+        self.log.write(text)
+        self.log.flush()
+        return self.console.write(text)
+
+    def flush(self):
+        self.log.flush()
+        self.console.flush()
+
+    def __getattr__(self, name):
+        return getattr(self.console, name)
+
+
+def cmd_run_job(args):
+    """Windows runner 的内部入口：参数从 JSON 读取，保留完整输出与退出码。"""
+    log_dir = os.path.abspath(os.path.expanduser(args.log_dir))
+    os.makedirs(log_dir, exist_ok=True)
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    log_path = os.path.join(log_dir, "run-%s.log" % stamp)
+    old_out, old_err = sys.stdout, sys.stderr
+    rc = 1
+    with open(log_path, "w", encoding="utf-8") as log:
+        sys.stdout, sys.stderr = _LogStream(old_out, log), _LogStream(old_err, log)
+        try:
+            print("Started: %s" % now_iso(), flush=True)
+            print("Log: %s" % log_path, flush=True)
+            print("Python: %s" % sys.executable, flush=True)
+            with open(args.args_file, encoding="utf-8") as f:
+                job = json.load(f)
+            command = job.get("command", "migrate")
+            if command == "migrate":
+                if not job.get("dest_base"):
+                    raise ValueError("Job is missing dest_base")
+                print("Target: %s" % os.path.join(job["dest_base"], job.get("name") or ".workbuddy"), flush=True)
+                cmd_migrate(argparse.Namespace(
+                    dest_base=job["dest_base"], name=job.get("name"), args_file=None,
+                    src=None, force_any_dir=False, skip_app_handling=False,
+                    no_relaunch=False, keep_backup=False))
+            elif command == "restore":
+                if not job.get("plan"):
+                    raise ValueError("Job is missing plan")
+                cmd_restore(argparse.Namespace(plan=job["plan"], keep_backup=False,
+                                               hard_delete=False, no_relaunch=False))
+            else:
+                raise ValueError("Unsupported runner command: %s" % command)
+            rc = 0
+        except SystemExit as ex:
+            rc = ex.code if isinstance(ex.code, int) else (0 if ex.code is None else 1)
+            if ex.code is not None and not isinstance(ex.code, int):
+                print(str(ex.code), file=sys.stderr, flush=True)
+        except KeyboardInterrupt:
+            rc = 130
+            print("Interrupted. Check directory/link state before retrying.", file=sys.stderr, flush=True)
+        except Exception:
+            traceback.print_exc()
+            rc = 1
+        finally:
+            try:
+                print("\nRESULT: %s (exit code %d)" % ("SUCCESS" if rc == 0 else "FAILED", rc), flush=True)
+                print("Finished: %s\nLog: %s" % (now_iso(), log_path), flush=True)
+            finally:
+                sys.stdout, sys.stderr = old_out, old_err
+    raise SystemExit(rc)
+
+
+def windows_runner_content(job_name):
+    """ASCII 启动器；中文路径只来自环境变量或 JSON，cmd /K 保留结果窗口。"""
+    return "\r\n".join([
+        "@echo off",
+        "setlocal DisableDelayedExpansion",
+        'if /I "%~1"=="--console" goto run',
+        '"%ComSpec%" /D /V:OFF /K ""%~f0" --console"',
+        "exit /b",
+        ":run",
+        "chcp 65001 >nul",
+        'title WorkBuddy cache mover',
+        'echo WorkBuddy cache mover - preparing to run.',
+        'echo WorkBuddy may close automatically. Do not reopen it during the operation.',
+        'set "PYEXE="',
+        'set "PYFLAG="',
+        "for /f \"delims=\" %%P in ('where py.exe 2^>nul') do if not defined PYEXE call :try_python \"%%P\" -3",
+        "for /f \"delims=\" %%P in ('where python.exe 2^>nul') do if not defined PYEXE call :try_python \"%%P\"",
+        'for /d %%D in ("%USERPROFILE%\\.workbuddy\\binaries\\python\\versions\\*") do if not defined PYEXE call :try_python "%%~fD\\python.exe"',
+        'for /d %%D in ("%USERPROFILE%\\.workbuddy\\binaries\\python\\versions\\*") do if not defined PYEXE call :try_python "%%~fD\\bin\\python.exe"',
+        "if defined PYEXE goto execute",
+        "echo ERROR: No working Python 3.8+ interpreter was found.",
+        "echo Install Python 3.8+ from python.org, then regenerate and rerun this launcher.",
+        'set "RC=1"',
+        "goto finish",
+        ":execute",
+        'echo Python: "%PYEXE%" %PYFLAG%',
+        '"%PYEXE%" %PYFLAG% -X utf8 -u "%~dp0cache_mover.py" run-job --args-file "%~dp0' + job_name + '" --log-dir "%LOCALAPPDATA%\\WorkBuddyCacheMover\\logs"',
+        'set "RC=%ERRORLEVEL%"',
+        ":finish",
+        "echo.",
+        'if "%RC%"=="0" (echo RESULT: SUCCESS) else (echo RESULT: FAILED - exit code %RC%)',
+        'echo Logs, if the job started: "%LOCALAPPDATA%\\WorkBuddyCacheMover\\logs"',
+        'echo This window stays open. Read the result, then close it or type EXIT.',
+        "exit /b %RC%",
+        ":try_python",
+        'if /I "%~dp1"=="%LOCALAPPDATA%\\Microsoft\\WindowsApps\\" exit /b 0',
+        '"%~1" %~2 -c "import sys; sys.exit(0 if sys.version_info >= (3, 8) else 1)" >nul 2>&1',
+        "if errorlevel 1 exit /b 0",
+        'set "PYEXE=%~1"',
+        'set "PYFLAG=%~2"',
+        "exit /b 0",
+        "",
+    ])
+
+
 def cmd_make_runner(args):
     command = args.command
     os.makedirs(PLAN_DIR, exist_ok=True)
     local_script = os.path.join(PLAN_DIR, "cache_mover.py")
-    shutil.copy2(os.path.abspath(__file__), local_script)
+    if os.path.realpath(__file__) != os.path.realpath(local_script):
+        shutil.copy2(os.path.abspath(__file__), local_script)
     if command == "migrate":
         if not args.dest_base:
             sys.exit("migrate 模式需要 --dest-base <目录>（将创建 <目录>/.workbuddy）。")
         args_file = os.path.join(PLAN_DIR, "migrate-args.json")
-        payload = {"dest_base": os.path.abspath(os.path.expanduser(args.dest_base))}
+        payload = {"command": "migrate", "dest_base": os.path.abspath(os.path.expanduser(args.dest_base))}
         if args.name:
             payload["name"] = args.name
         with open(args_file, "w", encoding="utf-8") as f:
@@ -864,29 +985,19 @@ def cmd_make_runner(args):
         ]
     if os.name == "nt":
         out = args.out or os.path.join(PLAN_DIR, "run_%s.bat" % command)
-        # 解释器探测链：py 启动器 → PATH 里的 python → WorkBuddy 自带 Python。
-        # 注意：bat 内容全部用字符串拼接生成——模板里的 %USERPROFILE%/%%F 等
-        # 会被 Python % 格式化当作非法转换符（ValueError: unsupported format character）
-        pre = [
-            "@echo off",
-            "chcp 65001 >nul",
-            'set "PYEXE="',
-            "where py >nul 2>&1 && set \"PYEXE=py\"",
-            "if not defined PYEXE where python >nul 2>&1 && set \"PYEXE=python\"",
-            'if not defined PYEXE for %%F in ("%USERPROFILE%\\.workbuddy\\binaries\\python\\versions\\*\\python.exe") do if not defined PYEXE set "PYEXE=%%~fF"',
-            "if not defined PYEXE (",
-            "    echo ERROR: Python not found.",
-            "    echo Install Python 3.8+ from python.org or Microsoft Store, or reinstall WorkBuddy,",
-            "    echo then run this script again.",
-            "    pause",
-            "    exit /b 1",
-            ")",
-        ]
-        body = ["pause" if b == "pause" else "echo " + b for b in banner]
-        py_lines = [
-            '"%PYEXE%" "%USERPROFILE%\\.wb-cache-move\\cache_mover.py" ' + invoke,
-        ]
-        content = "\r\n".join(pre + body + py_lines + ["echo.", "pause", ""])
+        job_name = "migrate-args.json" if command == "migrate" else "runner-restore-args.json"
+        if command == "restore":
+            with open(os.path.join(PLAN_DIR, job_name), "w", encoding="utf-8") as f:
+                json.dump({"command": command, "plan": plan["plan_path"]}, f,
+                          ensure_ascii=False, indent=2)
+        # --out 可位于其他目录：启动器所需文件也放到该目录。
+        out_dir = os.path.dirname(os.path.abspath(os.path.expanduser(out)))
+        out = os.path.join(out_dir, os.path.basename(out))
+        os.makedirs(out_dir, exist_ok=True)
+        if os.path.realpath(out_dir) != os.path.realpath(PLAN_DIR):
+            shutil.copy2(local_script, os.path.join(out_dir, "cache_mover.py"))
+            shutil.copy2(os.path.join(PLAN_DIR, job_name), os.path.join(out_dir, job_name))
+        content = windows_runner_content(job_name)
         if not content.isascii():
             sys.exit("内部错误: bat 内容必须为 ASCII。")
         with open(out, "w", encoding="ascii", newline="") as f:
@@ -920,15 +1031,16 @@ def cmd_make_runner(args):
             f.write(content)
         os.chmod(out, 0o755)
     print("✓ 已生成独立运行脚本: %s" % out)
+    if os.name == "nt":
+        print("  双击运行；无需按键开始。结束后窗口保持打开，显示 SUCCESS 或 FAILED 与退出码。")
+        print("  运行日志: %LOCALAPPDATA%\\WorkBuddyCacheMover\\logs（恢复原状后仍保留）")
+        print("  更新脚本后必须重新运行 make-runner；旧 .bat 不会自动更新。")
     if command == "migrate":
-        print("  使用方式：双击运行（或在终端执行 bash %s），全自动完成：" % out)
+        print("  使用方式：双击运行，全自动完成：")
         print("  自动关闭 WorkBuddy → 复制+校验 → 建软链接 → 自动重新打开 WorkBuddy")
         print("  迁移目标: %s" % payload["dest_base"])
     else:
-        print("  操作序列：")
-        print("  1) 完全退出 WorkBuddy")
-        print("  2) 双击运行 %s" % out)
-        print("  3) 看到完成提示后，重新打开 WorkBuddy")
+        print("  双击运行，自动关闭 WorkBuddy → 最新数据迁回 → 自动重开 → 清理迁移产物。")
 
 
 def _rmdir_if_empty(path):
@@ -1115,6 +1227,7 @@ def cmd_restore(args):
         print("      " + copy_note)
     removed = []
     for f in ("run_migrate.command", "run_migrate.bat", "migrate-args.json",
+              "runner-restore-args.json",
               "run_swap.command", "run_swap.bat",
               "run_restore.command", "run_restore.bat",
               "cache_mover.py", os.path.basename(plan["plan_path"])):
@@ -1170,6 +1283,11 @@ def main():
     m.add_argument("--plan", default="latest", help="swap/restore 模式使用的 plan（默认 latest）")
     m.add_argument("--out", default=None, help="输出脚本路径")
     m.set_defaults(func=cmd_make_runner)
+
+    job = sub.add_parser("run-job", help="runner 内部入口：读取 JSON 参数并保存运行日志")
+    job.add_argument("--args-file", required=True)
+    job.add_argument("--log-dir", required=True)
+    job.set_defaults(func=cmd_run_job)
 
     r = sub.add_parser("rollback", help="仅回滚：当前数据迁回原位（含迁移期间变更），保留旧快照与 plan")
     r.add_argument("--plan", required=True, help="plan 文件路径，或 latest")

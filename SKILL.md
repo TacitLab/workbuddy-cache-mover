@@ -64,7 +64,7 @@ Windows `D:\wb-data`）。向用户确认最终路径与预期行为：
 - 源：`~/.workbuddy`（X GB）
 - 目标：`<用户指定基准>/.workbuddy`
 - 过程：脚本会自动关闭 WorkBuddy，迁移完成后自动重新打开
-- 迁移完成后：校验通过即把原始数据移入废纸篓（不占双倍空间；如反悔可从废纸篓找回）
+- 迁移完成后：校验通过即把原始数据移入废纸篓；废纸篓中的数据仍占磁盘空间，确认迁移正常后由用户清空，才释放原盘空间。如反悔可从废纸篓找回。
 
 用户明确同意后才进入下一步。
 
@@ -80,6 +80,19 @@ python3 $SCRIPT make-runner --dest-base "<用户指定基准目录>"
 告知用户操作（原样转述）：**双击运行 `~/.wb-cache-move/run_migrate.command`，脚本会自动
 完成关闭 WorkBuddy → 复制+校验 → 建软链接 → 重新打开 WorkBuddy，看到 Done 即完成。
 迁移期间（几分钟）不要使用 WorkBuddy。**
+
+Windows 修正版行为：双击 `.bat` 后自动开始，无需按键。结束时明确显示 `RESULT: SUCCESS`
+或 `RESULT: FAILED` 与退出码，窗口继续保留，用户读完结果后关闭窗口或输入 `EXIT`。
+Python 输出实时显示并写入 UTF-8 日志：
+`%LOCALAPPDATA%\WorkBuddyCacheMover\logs\run-*.log`。该日志位于迁移目录之外，restore 后仍保留。
+解释器启动前失败（如未找到可用 Python）会留在窗口显示，此时不会生成 Python 运行日志。
+
+Windows 遇到「按任意键后窗口消失」时，先检查屏幕是否为旧版本结尾的 `pause`。
+它表示运行已结束，不代表开始运行，也不能作为迁移成功的依据。
+不要在迁移状态未知时直接重跑；先读取错误/日志，再用 detect 确认目录和链接状态。
+更新 Skill 内的 Python 脚本后，必须重新生成 runner，已有 `.bat` 与其旁边的脚本副本不会自动更新。
+中文用户名和目标路径保存在 JSON 中，启动器仅含 ASCII，并以自身所在目录定位脚本和参数。
+窗口的成功提示意味着命令正常结束；仍需第 4 步确认应用工作正常。
 
 ### 第 4 步：验证
 
@@ -144,6 +157,8 @@ python3 $SCRIPT rollback --plan <plan路径>
 | 现象 | 说明 |
 | --- | --- |
 | migrate 在会话内运行被拒（unknown/受限环境） | 设计行为：migrate 要关闭 WorkBuddy，只能通过 runner 或终端运行 |
+| Windows 按任意键后窗口关闭，无法确认结果 | 旧 `.bat` 的最后一行是 `pause`，按键会结束窗口。替换脚本并重新 make-runner；修正版保留窗口、显示退出码，并在 `%LOCALAPPDATA%\WorkBuddyCacheMover\logs` 保存日志 |
+| Windows 显示找不到可用 Python | 修正版会实际检查 Python 版本 >= 3.8；跳过 WindowsApps 快捷别名。请安装独立 Python 后重新运行；此阶段尚未开始迁移 |
 | migrate 自动退出 WorkBuddy 失败 | 用户手动退出后重新双击 runner 即可（脚本未做任何改动） |
 | **迁移中途用户打开了 WorkBuddy** | 复制期间打开：严格校验发现差异 → 中止，源目录无损；校验期间打开：进程复查 + 二轮校验双重拦截 → 中止；改名瞬间打开（极小概率）：rename 异常被捕获 → 中止，源目录无损。所有时点均"宁可中止不冒险"，重跑即可 |
 | 严格校验失败（多出/缺失/大小不一致文件） | 目标目录有脏数据或迁移期间有外部写入；脚本中止且源目录原样保留，排查后重跑 |
