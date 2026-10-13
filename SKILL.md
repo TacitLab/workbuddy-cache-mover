@@ -117,27 +117,27 @@ python3 $SCRIPT cleanup-backup --plan <plan路径> --yes
 
 用户说「恢复原状」「搬回去」「还原迁移」时触发。
 
-**数据源 = 软链接指向的当前实际位置**（含迁移后全部变更），绝不用旧快照：
-移除软链接 → 当前数据迁回 `~/.workbuddy`（同卷 rename 瞬间完成 / 跨卷复制+严格校验，
-失败自动恢复软链接）→ 清理旧快照（如有）与 plan/runner 痕迹 → 一切回到迁移前，
-**迁移期间的变更零丢失**。
-
-1. restore 需要移动 `~/.workbuddy`，不能在会话内直接跑；生成 restore 版独立脚本：
+**数据源 = 软链接指向的当前实际位置**（含迁移后全部变更），绝不用旧快照。
+**全自动**：自动关闭 WorkBuddy → 数据迁回 `~/.workbuddy`（同卷 rename 瞬间完成 / 跨卷
+复制+严格校验，失败自动恢复软链接）→ 自动重开 WorkBuddy → 清理旧快照（如有）与
+plan/runner 痕迹 → 一切回到迁移前，**迁移期间的变更零丢失**。
 
 ```bash
 python3 $SCRIPT make-runner --command restore
 ```
 
-2. 用户退出 WorkBuddy → 双击 `~/.wb-cache-move/run_restore.command`（.bat）→ 重开 WorkBuddy
+用户双击 `~/.wb-cache-move/run_restore.command`（.bat）即可，看到 Done 即完成。
 
 ### 仅回滚（rollback，保留迁移能力）
 
-用户说「数据搬回原位，但以后可能再迁」时使用（同样需退出 WorkBuddy 后执行）。
-数据源同样是当前实际位置（含迁移后全部变更），同卷 rename / 跨卷复制+校验：
+用户说「数据搬回原位，但以后可能再迁」时使用。同样全自动（自动关 WB → 数据迁回 →
+自动重开），数据源同样是当前实际位置（含迁移后全部变更）：
 
 ```bash
 python3 $SCRIPT rollback --plan <plan路径>
 ```
+
+（rollback 需要 plan 存在；若在会话内发起，同样通过 runner 或让用户在终端执行。）
 
 ## 常见问题
 

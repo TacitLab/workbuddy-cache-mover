@@ -858,9 +858,9 @@ def cmd_make_runner(args):
         plan_rel = os.path.basename(plan["plan_path"])
         invoke = "%s --plan %s" % (command, os.path.join(PLAN_DIR, plan_rel))
         banner = [
-            "WorkBuddy cache migration - phase 2 (%s)." % command,
-            "Please make sure WorkBuddy has been QUIT before continuing.",
-            "pause",
+            "WorkBuddy cache migration - %s." % command,
+            "WorkBuddy will be closed automatically, then relaunched when done.",
+            "Please do NOT use WorkBuddy until this window says Done.",
         ]
     if os.name == "nt":
         out = args.out or os.path.join(PLAN_DIR, "run_%s.bat" % command)
@@ -978,6 +978,27 @@ def move_dest_back(src, dest):
     return "copy", note
 
 
+def auto_manage_app(args, action_label):
+    """restore/rollback 版的应用管理：检测 WB 运行则自动优雅关闭，
+    返回 (manage_apps, relaunch_paths)。与 migrate 的差别：不做 unknown
+    拦截前置（进程检测 unknown 时仍允许继续——此时用户在终端/runner 环境，
+    检测受限不代表应用在运行；数据一致性由严格校验兜底）。"""
+    state, procs = detect_app_running()
+    relaunch = []
+    if state == "running":
+        print("[%s] 检测到 WorkBuddy 运行中，自动优雅退出 ..." % action_label)
+        relaunch = graceful_quit_all(procs)
+        state2, _ = detect_app_running()
+        if state2 != "not-running":
+            sys.exit("自动退出 WorkBuddy 失败，请手动退出后重新运行。")
+    elif state == "unknown":
+        print("[%s] 无法检测 WorkBuddy 进程状态（受限环境），按未运行继续；" % action_label)
+        print("      若迁移后校验发现异常会自动中止保护数据。")
+    else:
+        print("[%s] WorkBuddy 未在运行。" % action_label)
+    return relaunch
+
+
 def cmd_rollback(args):
     """仅回滚：把当前缓存数据放回默认路径，保留旧快照与 plan（便于再次迁移）。
     数据源 = 软链接指向的当前实际位置（含迁移期间全部变更），不用备份快照，零丢失。"""
@@ -991,16 +1012,19 @@ def cmd_rollback(args):
         sys.exit("源路径不是软链接: %s，请人工检查。" % src)
     if os.path.normpath(os.path.abspath(cur)) != os.path.normpath(os.path.abspath(dest)):
         sys.exit("软链接指向 %s 与 plan 目标 %s 不符，请人工检查。" % (cur, dest))
-    require_offline(args)
-    print("[1/3] 移除软链接: %s" % src)
+    relaunch = auto_manage_app(args, "1/4")
+    print("[2/4] 移除软链接: %s" % src)
     remove_link(src)
     if os.path.lexists(src):
         sys.exit("移除软链接失败，原样保留，请人工检查。")
-    print("[2/3] 当前缓存数据迁回默认路径（数据源=当前实际位置，含迁移期间全部变更）...")
+    print("[3/4] 当前缓存数据迁回默认路径（数据源=当前实际位置，含迁移期间全部变更）...")
     mode, msg = move_dest_back(src, dest)
     plan.update(swapped=False, rolled_back_at=now_iso())
     save_plan(plan)
-    print("[3/3] 完成。")
+    print("[4/4] 完成。")
+    if relaunch and not getattr(args, "no_relaunch", False):
+        relaunch_apps(relaunch)
+        print("      已重新启动 WorkBuddy。")
     print()
     print("✓ 已回滚，%s 恢复为真实目录（迁移期间全部变更保留，无数据丢失）。" % src)
     if mode == "copy":
@@ -1060,6 +1084,7 @@ def cmd_restore(args):
     src, dest, backup = plan["src"], plan["dest"], plan["backup"]
     cur = link_target(src)
     copy_note = ""
+    relaunch = []
     if cur is None and os.path.isdir(src):
         print("源路径已是真实目录（此前已回滚），跳过数据迁回。")
     elif cur is None:
@@ -1067,16 +1092,19 @@ def cmd_restore(args):
     else:
         if os.path.normpath(os.path.abspath(cur)) != os.path.normpath(os.path.abspath(dest)):
             sys.exit("软链接指向 %s 与 plan 目标 %s 不符，请人工检查。" % (cur, dest))
-        require_offline(args)
-        print("[1/3] 移除软链接: %s" % src)
+        relaunch = auto_manage_app(args, "1/4")
+        print("[2/4] 移除软链接: %s" % src)
         remove_link(src)
         if os.path.lexists(src):
             sys.exit("移除软链接失败，原样保留，请人工检查。")
-        print("[2/3] 当前缓存数据迁回默认路径（数据源=当前实际位置，含迁移期间全部变更）...")
+        print("[3/4] 当前缓存数据迁回默认路径（数据源=当前实际位置，含迁移期间全部变更）...")
         _mode, copy_note = move_dest_back(src, dest)
         plan.update(swapped=False, restored_at=now_iso())
         save_plan(plan)
-    print("[3/3] 清理迁移产物（旧快照 + plan/runner）...")
+        if relaunch and not getattr(args, "no_relaunch", False):
+            print("[4/4] 重新启动 WorkBuddy ...")
+            relaunch_apps(relaunch)
+    print("[%s] 清理迁移产物（旧快照 + plan/runner）..." % ("4/4" if not relaunch else "+"))
     if os.path.isdir(backup):
         if args.keep_backup:
             print("      按要求保留旧快照: %s" % backup)
@@ -1143,9 +1171,9 @@ def main():
     m.add_argument("--out", default=None, help="输出脚本路径")
     m.set_defaults(func=cmd_make_runner)
 
-    r = sub.add_parser("rollback", help="仅回滚：移除软链接，恢复原目录（保留目标副本）")
+    r = sub.add_parser("rollback", help="仅回滚：当前数据迁回原位（含迁移期间变更），保留旧快照与 plan")
     r.add_argument("--plan", required=True, help="plan 文件路径，或 latest")
-    r.add_argument("--allow-app-running", action="store_true")
+    r.add_argument("--no-relaunch", action="store_true", help="回滚完成后不自动重新打开 WorkBuddy")
     r.set_defaults(func=cmd_rollback)
 
     cb = sub.add_parser("cleanup-backup", help="迁移稳定后清理历史备份（默认移入废纸篓，需 --yes）")
@@ -1158,7 +1186,7 @@ def main():
     rs.add_argument("--plan", required=True, help="plan 文件路径，或 latest")
     rs.add_argument("--keep-backup", action="store_true", help="保留迁移时刻的旧快照，仅清理其他产物")
     rs.add_argument("--hard-delete", action="store_true", help="旧快照不进废纸篓，永久删除")
-    rs.add_argument("--allow-app-running", action="store_true")
+    rs.add_argument("--no-relaunch", action="store_true", help="恢复完成后不自动重新打开 WorkBuddy")
     rs.set_defaults(func=cmd_restore)
 
     st = sub.add_parser("status", help="等同 detect")
