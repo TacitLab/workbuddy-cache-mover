@@ -80,7 +80,7 @@ def is_reparse_dir(path):
 
 def make_link(target, link_path):
     """在 link_path 创建指向 target 的链接（目录）。"""
-    target = os.path.abspath(target)
+    target = display_path(os.path.abspath(target))
     if os.name == "nt":
         if target.startswith("\\\\"):  # UNC 网络路径，junction 不支持，需管理员 symlink
             os.symlink(target, link_path, target_is_directory=True)
@@ -292,7 +292,7 @@ def windows_path(path):
         tail = path[4:]
         if not (tail.startswith('UNC\\') or (len(tail) >= 3 and tail[0].isalpha() and tail[1:3] == ':\\')):
             raise SafeAbort('不支持设备命名空间作为迁移目录。')
-        return path
+        return ntpath.normpath(path)
     if path.startswith('\\\\.\\'):
         raise SafeAbort('不支持设备路径作为迁移目录。')
     path = ntpath.abspath(path)
@@ -547,10 +547,10 @@ def run_copy(src, dest):
     previous = manifest(dest, label='检查临时副本')
     for rel, record in sorted(previous.items(), key=lambda item: item[0].count(os.sep)):
         if record['kind'] == 'dir':
-            path = os.path.join(dest, rel)
+            path = os.path.normpath(os.path.join(dest, rel))
             os.chmod(path, record['mode'] | statmod.S_IRUSR | statmod.S_IWUSR | statmod.S_IXUSR)
     for rel in sorted(set(previous) - set(records), key=lambda p: p.count(os.sep), reverse=True):
-        path = os.path.join(dest, rel)
+        path = os.path.normpath(os.path.join(dest, rel))
         if previous[rel]['kind'] in ('link', 'junction'):
             remove_link(path)
         elif previous[rel]['kind'] == 'dir':
@@ -559,7 +559,7 @@ def run_copy(src, dest):
             os.unlink(path)
     with Progress('[2/6] 正在复制', total, len(records)) as progress:
         for rel, record in sorted(records.items(), key=lambda item: (item[0].count(os.sep), item[0])):
-            s, d = os.path.join(src, rel), os.path.join(dest, rel)
+            s, d = os.path.normpath(os.path.join(src, rel)), os.path.normpath(os.path.join(dest, rel))
             os.makedirs(os.path.dirname(d), mode=0o700, exist_ok=True)
             kind = record['kind']
             if kind == 'dir':
@@ -601,7 +601,7 @@ def run_copy(src, dest):
             progress.update(count=1)
         for rel, record in sorted(records.items(), key=lambda item: -1 if item[0] == '.' else item[0].count(os.sep), reverse=True):
             if record['kind'] == 'dir':
-                shutil.copystat(os.path.join(src, rel), os.path.join(dest, rel), follow_symlinks=False)
+                shutil.copystat(os.path.normpath(os.path.join(src, rel)), os.path.normpath(os.path.join(dest, rel)), follow_symlinks=False)
     return 'python-stream'
 
 

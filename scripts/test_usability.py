@@ -103,6 +103,27 @@ class UsabilityTests(unittest.TestCase):
             shutil.rmtree(m.native_path(source))
             shutil.rmtree(m.native_path(target))
 
+    @unittest.skipUnless(os.name == 'nt', 'Native Windows junction long path regression')
+    def test_junction_inside_deep_copy_keeps_target_and_can_be_removed(self):
+        with tempfile.TemporaryDirectory(prefix='wb-junction-') as root, contextlib.redirect_stdout(io.StringIO()):
+            source, target, external = [os.path.join(root, name) for name in ('source', 'target', 'external')]
+            deep = os.path.join(source, *(['nested-' + 'x' * 60] * 4))
+            os.makedirs(m.native_path(deep))
+            os.mkdir(external)
+            link = m.native_path(os.path.join(deep, 'linked'))
+            m.make_link(external, link)
+            try:
+                m.run_copy(source, target)
+                self.assertTrue(m.verify_strict(source, target))
+                copied = m.native_path(os.path.join(target, os.path.relpath(m.display_path(link), source)))
+                m.remove_link(copied)
+                self.assertTrue(os.path.isdir(external))
+            finally:
+                m.remove_link(link)
+                shutil.rmtree(m.native_path(source))
+                if os.path.isdir(m.native_path(target)):
+                    shutil.rmtree(m.native_path(target))
+
     def test_explicit_python_outside_data_is_accepted(self):
         with tempfile.TemporaryDirectory(prefix='wb-python-') as root:
             with mock.patch.object(m, 'DEFAULT_SRC', os.path.join(root, '.workbuddy')):
