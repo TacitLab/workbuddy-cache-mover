@@ -542,12 +542,14 @@ def recycle_with_permissions(path):
         _PROMPTING.set()
         report, report_path = None, None
         try:
+            print('\n回收受阻，正在有界检查旧副本的删除权限 ...', flush=True)
             permission_scope(path)
             api = WindowsACL()
             root_before = api.read(path)
             candidates, checked = permission_probe(path, api)
             if not candidates:
                 raise OSError('有界检查未找到可安全解除的当前账号删除拒绝规则；不能据此排除其他权限、占用或系统限制。')
+            print('已定位 %d 个受阻范围，正在核对拟修改对象 ...' % len(candidates), flush=True)
             changes = permission_changes(path, candidates, api)
             if not changes:
                 raise OSError('未找到可修改的删除拒绝位，旧副本保留。')

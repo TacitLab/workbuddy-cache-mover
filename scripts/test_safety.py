@@ -289,6 +289,15 @@ except m.BusyError: sys.exit(4)
         self.assertTrue(m.same_path(self.src, self.dest))
         self.assertEqual(m.load_plan('latest')['stage'], 'complete')
 
+    def test_cleanup_only_failure_keeps_data_and_reports_warning(self):
+        plan = self.migrate()
+        with mock.patch.object(m, 'trash_path', side_effect=OSError('permissions not authorized')):
+            rc = m.execute_logged(lambda: m.cmd_cleanup_backup(self.restore_args(plan=plan['plan_path'])), os.path.join(self.root, 'logs'))
+        self.assertEqual(rc, 2)
+        self.assertTrue(os.path.isdir(plan['backup']))
+        self.assertTrue(m.same_path(self.src, self.dest))
+        self.assertFalse(m.load_plan(plan['plan_path']).get('backup_removed', False))
+
     def test_restore_cleanup_can_be_retried_without_copying_data_again(self):
         self.migrate()
         with mock.patch.object(m, 'trash_path', side_effect=OSError('unsupported recycle')):

@@ -31,18 +31,38 @@ class StrategyTests(unittest.TestCase):
         with mock.patch.object(m.os,'name','posix'),mock.patch.object(m.shutil,'which',return_value=None):
             with self.assertRaises(m.UnsupportedEnvironment):m.resolve_copy_engine('rsync')
     def test_invalid_settings_stop_without_actions(self):
-        for data in ({'copy_engine':'shell rm'},{'display':'unknown'},{'cleanup':'delete'}):
+        for data in ({'copy_engine':'shell rm'},{'display':'unknown'},{'cleanup':'delete'},{'permission_repair':'auto'}):
             with self.assertRaises(m.SafeAbort):m.validate_settings(argparse.Namespace(**data))
     def test_generator_records_configuration_and_single_entry(self):
         with tempfile.TemporaryDirectory() as root,contextlib.redirect_stdout(io.StringIO()):
-            args=argparse.Namespace(command='migrate',dest_base=os.path.join(root,'destination'),name=None,out=None,plan='latest',copy_engine='python',cleanup='keep',display='compact',workers=2)
+            args=argparse.Namespace(command='migrate',dest_base=os.path.join(root,'destination'),name=None,out=None,plan='latest',copy_engine='python',cleanup='keep',display='compact',workers=2,permission_repair='off')
             with mock.patch.object(m,'PLAN_DIR',os.path.join(root,'runner')):
                 m.cmd_make_runner(args)
             folder=os.path.join(root,'runner')
             with open(os.path.join(folder,'migrate-args.json'),encoding='utf8') as f:job=json.load(f)
             self.assertEqual((job['copy_engine'],job['cleanup'],job['display'],job['workers']),('python','keep','compact',2))
             self.assertIn('capability_report',job)
+            self.assertEqual(job['permission_repair'],'off')
+            self.assertEqual(m._PERMISSION_REPAIR,'ask')
             self.assertEqual(sum(name.endswith(('.sh','.command','.bat','.cmd')) for name in os.listdir(folder)),1)
+    def test_cleanup_only_runner_does_not_dispatch_copying_or_app_shutdown(self):
+        with tempfile.TemporaryDirectory() as root,contextlib.redirect_stdout(io.StringIO()):
+            plan_path=os.path.join(root,'plan.json')
+            data=dict(src=os.path.join(root,'src'),dest=os.path.join(root,'dst'),backup=os.path.join(root,'src')+m.BACKUP_SUFFIX)
+            m.atomic_json(plan_path,data)
+            folder=os.path.join(root,'runner')
+            args=argparse.Namespace(command='cleanup-backup',plan=plan_path,out=None,permission_repair='ask')
+            with mock.patch.object(m,'PLAN_DIR',folder):m.cmd_make_runner(args)
+            args_file=os.path.join(folder,'runner-cleanup-backup-args.json')
+            with open(args_file,encoding='utf8') as f:job=json.load(f)
+            self.assertEqual(job['command'],'cleanup-backup')
+            with mock.patch.object(m,'cmd_cleanup_backup') as cleanup,mock.patch.object(m,'run_copy') as copy,mock.patch.object(m,'auto_manage_app') as quit_app:
+                with self.assertRaises(SystemExit) as result:
+                    m.cmd_run_job(argparse.Namespace(args_file=args_file,log_dir=os.path.join(root,'logs')))
+                self.assertEqual(result.exception.code,0)
+                self.assertTrue(cleanup.call_args.args[0].yes)
+                self.assertEqual(cleanup.call_args.args[0].permission_repair,'ask')
+                copy.assert_not_called();quit_app.assert_not_called()
     def test_unvalidated_native_engine_does_not_generate_runner(self):
         with tempfile.TemporaryDirectory() as root:
             args=argparse.Namespace(command='migrate',dest_base=os.path.join(root,'destination'),name=None,out=None,plan='latest',copy_engine='rsync')

@@ -154,6 +154,7 @@ class NativePermissionTests(unittest.TestCase):
             file = os.path.join(day, '日志.log')
             with open(file, 'wb') as f: f.write(b'payload')
             external = os.path.join(root, 'external'); os.mkdir(external)
+            link = os.path.join(day, 'junction'); m.make_link(external, link)
             api = m.WindowsACL()
             try:
                 # 普通 WRITE_DAC 句柄在夹具中建立真实可继承的拒绝规则。
@@ -165,7 +166,6 @@ class NativePermissionTests(unittest.TestCase):
                     api.set_handle(handle, raw)
                 inherited = m.acl_entries(bytes.fromhex(api.read(file)['acl']))[1]
                 self.assertTrue(any(m.delete_deny(a, api.sid) and a[1] & 16 for a in inherited))
-                link = os.path.join(day, 'junction'); m.make_link(external, link)
                 external_before = api.read(external)
                 changes = m.permission_changes(source, [day], api)
                 self.assertEqual({c['path'] for c in changes}, {day, file})
@@ -184,12 +184,11 @@ class NativePermissionTests(unittest.TestCase):
                 finally: shutil.rmtree(m.native_path(recycled))
             finally:
                 # 清理失败时也只修复本夹具，避免影响测试账户与用户目录。
-                link = os.path.join(day, 'junction')
-                if m.link_target(link) is not None: m.remove_link(link)
                 for path in (day, file):
                     if os.path.exists(path):
                         item = api.read(path)
                         if item['acl']: api.repair(path, item)
+                if m.link_target(link) is not None: m.remove_link(link)
 
     def test_hardlinked_file_is_never_modified(self):
         with tempfile.TemporaryDirectory(prefix='wb-acl-hardlink-') as root:
