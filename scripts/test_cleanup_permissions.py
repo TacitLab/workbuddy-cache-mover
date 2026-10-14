@@ -125,6 +125,15 @@ class PermissionTests(unittest.TestCase):
             with self.assertRaises(OSError): m.recycle_with_permissions(self.backup)
         self.assertEqual(recycle.call_count, 1)
         self.assertNotIn(self.file, self.api.repaired)
+    def test_changed_live_link_after_confirmation_prevents_all_modifications(self):
+        elsewhere = os.path.join(self.root, 'other'); os.mkdir(elsewhere)
+        def answer(prompt):
+            m.remove_link(self.src); m.make_link(elsewhere, self.src)
+            return 'REPAIR'
+        with mock.patch.object(m, 'windows_recycle', side_effect=self.failure) as recycle, mock.patch('builtins.input', side_effect=answer):
+            with self.assertRaises(OSError): m.recycle_with_permissions(self.backup)
+        self.assertEqual(recycle.call_count, 1)
+        self.assertFalse(self.api.repaired)
     def test_failed_permission_backup_prevents_prompt_and_mutation(self):
         with mock.patch.object(m, 'windows_recycle', side_effect=self.failure), mock.patch.object(m, 'atomic_json', side_effect=OSError('disk full')), mock.patch('builtins.input') as ask:
             with self.assertRaises(OSError): m.recycle_with_permissions(self.backup)

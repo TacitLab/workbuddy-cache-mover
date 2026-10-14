@@ -432,7 +432,13 @@ def permission_scope(path):
     if not any(p and os.path.normcase(os.path.abspath(p)) == os.path.normcase(os.path.abspath(path)) for p in expected):
         raise OSError('不是本次记录的旧副本，仅报告权限问题，不修改。')
     guard_common(path)
-    current = resolved_link(plan['src']) or plan['src']
+    target = resolved_link(plan['src'])
+    restored = plan.get('action') in ('restore', 'rollback')
+    if ((not restored and (target is None or not same_path(target, plan['dest']))) or
+            (restored and (target is not None or (plan.get('restored_identity') and
+                                                  identity(plan['src']) != plan['restored_identity'])))):
+        raise OSError('当前数据位置或身份与阶段记录不符，拒绝修改旧副本权限。')
+    current = target or plan['src']
     if not os.path.isdir(plan['src']) or is_within(path, current) or is_within(current, path):
         raise OSError('旧副本与当前数据范围重叠或当前路径不可用，拒绝修改。')
     guarded_permission_path(path, path)
