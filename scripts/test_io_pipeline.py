@@ -106,6 +106,20 @@ class PipelineTests(unittest.TestCase):
             shutil.rmtree(m.native_path(recycled))
 
 
+    @unittest.skipUnless(os.name == 'nt', 'Native Windows long directory recycle fixture')
+    def test_native_deep_directory_can_be_recycled_without_losing_contents(self):
+        deep = os.path.join(self.src, *(['directory-' + 'x' * 55] * 4))
+        os.makedirs(m.native_path(deep))
+        relative = os.path.relpath(os.path.join(deep, 'deep.txt'), self.src)
+        with open(m.native_path(os.path.join(self.src, relative)), 'wb') as f: f.write(b'deep payload')
+        recycled = m.windows_recycle(self.src)
+        self.assertTrue(recycled)
+        self.assertIn('$recycle.bin', recycled.lower())
+        try:
+            with open(m.native_path(os.path.join(recycled, relative)), 'rb') as f: self.assertEqual(f.read(), b'deep payload')
+        finally:
+            shutil.rmtree(m.native_path(recycled))
+
     @unittest.skipUnless(os.name == 'nt', 'Native Windows complex recycle fixture')
     def test_complex_recycle_never_permanently_deletes_a_junction_target(self):
         deep = os.path.join(self.src, *(['directory-' + 'x' * 55] * 4))
