@@ -152,7 +152,7 @@ def windows_recycle(path):
         return c.WINFUNCTYPE(HRESULT, PTR, *types)(table[index])(ptr, *args)
     checked(ole.CoInitializeEx(None, 2), '初始化回收站接口')
     operation, item = PTR(), PTR()
-    state = {'references': 1, 'recycled': 0, 'path': None, 'error': None}
+    state = {'references': 1, 'recycled': 0, 'path': None, 'error': None, 'blocked': False}
     callbacks = []
     class Sink(c.Structure):
         _fields_ = [('table', c.POINTER(PTR))]
@@ -172,7 +172,10 @@ def windows_recycle(path):
         state['references'] -= 1
         return state['references']
     def before_delete(this, flags, original):
-        return recycle_precheck(flags)
+        result = recycle_precheck(flags)
+        if result < 0:
+            state['blocked'] = True
+        return result
     def after_delete(this, flags, original, hr, new_item):
         if hr < 0:
             state['error'] = hr
@@ -204,7 +207,10 @@ def windows_recycle(path):
         checked(call(operation, 5, [UINT], 0x20180414), '设置仅回收模式')
         checked(shell.SHCreateItemFromParsingName(path, None, c.byref(iid_item), c.byref(item)), '读取旧副本目录')
         checked(call(operation, 18, [PTR, PTR], item, c.byref(sink)), '提交回收操作')
-        checked(call(operation, 21, []), '回收操作')
+        performed = call(operation, 21, [])
+        if state['blocked']:
+            raise OSError('Windows 要求对部分条目永久删除，已拒绝该降级；旧副本或剩余内容保留。')
+        checked(performed, '回收操作')
         aborted = c.c_int32()
         checked(call(operation, 22, [c.POINTER(c.c_int32)], c.byref(aborted)), '核对回收结果')
         if aborted.value or state['error'] is not None or not state['recycled'] or os.path.lexists(native_path(path)):
