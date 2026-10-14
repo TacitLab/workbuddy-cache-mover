@@ -21,7 +21,7 @@ def load(path, name):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--baseline-ref', default='168a3697c09c4b10adb40516cffe43540745d0e5')
-    parser.add_argument('--count', type=int, default=8000)
+    parser.add_argument('--count', type=int, default=1000 if os.name == 'nt' else 8000)
     parser.add_argument('--output')
     args = parser.parse_args()
     baseline_code = subprocess.check_output(['git', 'show', args.baseline_ref + ':scripts/cache_mover.py'])

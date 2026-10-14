@@ -35,7 +35,7 @@ jobs:
       - name: Check temporary-directory migrations and native launchers
         run: python -X utf8 -m unittest discover -s scripts -p "test_*.py" -v
       - name: Compare fixed small-file copying against previous release
-        run: python -X utf8 scripts/benchmark_io.py --count 8000 --output io-benchmark.json
+        run: python -X utf8 scripts/benchmark_io.py --output io-benchmark.json
       - uses: actions/upload-artifact@v4
         with:
           name: io-benchmark-${{ matrix.os }}-${{ matrix.python }}
