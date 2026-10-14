@@ -90,7 +90,7 @@ class SafetyTests(unittest.TestCase):
 
     def test_copy_failure_keeps_restore_link_and_retry_works(self):
         self.migrate()
-        def fail(source, target):
+        def fail(source, target, **kwargs):
             os.mkdir(target)
             with open(os.path.join(target, 'partial'), 'w') as f:
                 f.write('partial')
@@ -288,6 +288,31 @@ except m.BusyError: sys.exit(4)
         self.assertEqual(rc, 2)
         self.assertTrue(m.same_path(self.src, self.dest))
         self.assertEqual(m.load_plan('latest')['stage'], 'complete')
+
+    def test_restore_cleanup_can_be_retried_without_copying_data_again(self):
+        self.migrate()
+        with mock.patch.object(m, 'trash_path', side_effect=OSError('unsupported recycle')):
+            m.cmd_restore(self.restore_args())
+        plan = m.load_plan('latest')
+        self.assertEqual(plan['action'], 'restore')
+        self.assertEqual(plan['stage'], 'complete')
+        self.assertTrue(os.path.isdir(self.dest))
+        with mock.patch.object(m, 'trash_path', side_effect=self.fake_trash), mock.patch.object(m, 'run_copy') as copy:
+            m.cmd_cleanup_backup(self.restore_args(plan=plan['plan_path']))
+            copy.assert_not_called()
+        self.assertFalse(os.path.exists(self.dest))
+        self.assertTrue(os.path.isfile(os.path.join(self.src, '文件.bin')))
+
+    def test_restore_changed_old_location_is_not_cleaned(self):
+        self.migrate()
+        with mock.patch.object(m, 'trash_path', side_effect=OSError('unsupported recycle')):
+            m.cmd_restore(self.restore_args())
+        with open(os.path.join(self.dest, 'new.txt'), 'w') as f:
+            f.write('keep me')
+        with mock.patch.object(m, 'trash_path') as trash:
+            with self.assertRaises(m.SafeAbort):
+                m.cmd_cleanup_backup(self.restore_args())
+            trash.assert_not_called()
 
     def test_pending_operation_blocks_new_migration(self):
         os.makedirs(self.base)

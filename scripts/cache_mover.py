@@ -4,6 +4,8 @@
 import argparse
 import codecs
 import contextlib
+import collections
+import concurrent.futures
 import datetime
 import functools
 import glob
@@ -32,6 +34,8 @@ BACKUP_SUFFIX = ".wb-migration-backup"
 WIN_SYMLINK_HINT = "目标需支持目录链接；Windows 本地卷使用 junction，UNC 需 symlink 权限。"
 _ACTIVE = None
 _WARNINGS = []
+_IO_WORKERS = 4
+_COPY_RECEIPT = None
 NATIVE_WINDOWS = sys.platform == 'win32'
 FORCE_SIGNAL = getattr(signal, 'SIGKILL', 9)
 STAGES = {'prepared': '准备', 'copying': '复制数据', 'verifying': '内容校验',
@@ -109,6 +113,111 @@ def remove_link(link_path):
         return
     raise RuntimeError("路径不是软链接/junction: " + link_path)
 
+def recycle_precheck(flags):
+    # TRANSFER_SOURCE_FLAGS: shell 明确标记可回收时才允许继续，拒绝永久删除降级。
+    return 0 if flags & 0x80 else -2147467259
+
+
+def windows_recycle(path):
+    """直接使用 Windows Shell IFileOperation；不依赖 PowerShell/.NET UI 环境。"""
+    import ctypes as c
+    if sys.getwindowsversion()[:2] < (6, 2):
+        raise OSError('系统缺少仅回收模式，旧副本已保留。')
+    path = display_path(os.path.abspath(path))
+    if path.startswith('\\\\'):
+        raise OSError('Windows 不支持将网络路径直接移入本地回收站，旧副本已保留。')
+    HRESULT, PTR, UINT = c.c_int32, c.c_void_p, c.c_uint32
+    class GUID(c.Structure):
+        _fields_ = [('a', c.c_uint32), ('b', c.c_uint16), ('d', c.c_uint16), ('e', c.c_ubyte * 8)]
+    def guid(value):
+        return GUID.from_buffer_copy(uuid.UUID(value).bytes_le)
+    iid_operation = guid('947aab5f-0a5c-4c13-b4d6-4bf7836fc9f8')
+    iid_item = guid('43826d1e-e718-42ee-bc55-a1e261c37bfe')
+    clsid = guid('3ad05575-8857-4850-9277-11b85bdb8e09')
+    iid_sink = guid('04b0f1a7-9490-44bc-96e1-4296a31252e2')
+    iid_unknown = guid('00000000-0000-0000-c000-000000000046')
+    ole = c.OleDLL('ole32')
+    shell = c.WinDLL('shell32')
+    ole.CoInitializeEx.argtypes = [PTR, UINT]; ole.CoInitializeEx.restype = HRESULT
+    ole.CoCreateInstance.argtypes = [c.POINTER(GUID), PTR, UINT, c.POINTER(GUID), c.POINTER(PTR)]
+    ole.CoCreateInstance.restype = HRESULT
+    ole.CoTaskMemFree.argtypes = [PTR]
+    shell.SHCreateItemFromParsingName.argtypes = [c.c_wchar_p, PTR, c.POINTER(GUID), c.POINTER(PTR)]
+    shell.SHCreateItemFromParsingName.restype = HRESULT
+    def checked(hr, stage):
+        if hr < 0:
+            raise OSError('%s失败（HRESULT 0x%08X）；旧副本或剩余内容保留，未尝试永久删除。' % (stage, hr & 0xffffffff))
+    def call(ptr, index, types, *args):
+        table = c.cast(ptr, c.POINTER(c.POINTER(PTR))).contents
+        return c.WINFUNCTYPE(HRESULT, PTR, *types)(table[index])(ptr, *args)
+    checked(ole.CoInitializeEx(None, 2), '初始化回收站接口')
+    operation, item = PTR(), PTR()
+    state = {'references': 1, 'recycled': 0, 'path': None, 'error': None}
+    callbacks = []
+    class Sink(c.Structure):
+        _fields_ = [('table', c.POINTER(PTR))]
+    sink = Sink()
+    def query(this, requested, output):
+        c.cast(output, c.POINTER(PTR))[0] = None
+        key = c.string_at(requested, 16)
+        if key not in (bytes(iid_sink), bytes(iid_unknown)):
+            return -2147467262
+        c.cast(output, c.POINTER(PTR))[0] = c.addressof(sink)
+        state['references'] += 1
+        return 0
+    def addref(this):
+        state['references'] += 1
+        return state['references']
+    def release(this):
+        state['references'] -= 1
+        return state['references']
+    def before_delete(this, flags, original):
+        return recycle_precheck(flags)
+    def after_delete(this, flags, original, hr, new_item):
+        if hr < 0:
+            state['error'] = hr
+        elif new_item:
+            state['recycled'] += 1
+            name = PTR()
+            if call(new_item, 5, [UINT, c.POINTER(PTR)], 0x80058000, c.byref(name)) >= 0 and name:
+                state['path'] = c.wstring_at(name)
+                ole.CoTaskMemFree(name)
+        else:
+            state['error'] = -2147467259
+        return 0
+    # 按 SDK 声明顺序构造 IUnknown + IFileOperationProgressSink 的完整 vtable。
+    definitions = [([PTR, PTR], query), ([], addref), ([], release),
+                   ([], None), ([HRESULT], None), ([UINT, PTR, PTR], None),
+                   ([UINT, PTR, PTR, HRESULT, PTR], None), ([UINT, PTR, PTR, PTR], None),
+                   ([UINT, PTR, PTR, PTR, HRESULT, PTR], None), ([UINT, PTR, PTR, PTR], None),
+                   ([UINT, PTR, PTR, PTR, HRESULT, PTR], None), ([UINT, PTR], before_delete),
+                   ([UINT, PTR, HRESULT, PTR], after_delete), ([UINT, PTR, PTR], None),
+                   ([UINT, PTR, PTR, PTR, UINT, HRESULT, PTR], None), ([UINT, UINT], None),
+                   ([], None), ([], None), ([], None)]
+    for types, callback in definitions:
+        callbacks.append(c.WINFUNCTYPE(HRESULT, PTR, *types)(callback or (lambda *args: 0)))
+    table = (PTR * len(callbacks))(*(c.cast(callback, PTR).value for callback in callbacks))
+    sink.table = table
+    try:
+        checked(ole.CoCreateInstance(c.byref(clsid), None, 1, c.byref(iid_operation), c.byref(operation)), '创建回收站接口')
+        # RECYCLEONDELETE + ADDUNDORECORD + EARLYFAILURE + NOERRORUI + NOCONFIRMATION + SILENT。
+        checked(call(operation, 5, [UINT], 0x20180414), '设置仅回收模式')
+        checked(shell.SHCreateItemFromParsingName(path, None, c.byref(iid_item), c.byref(item)), '读取旧副本目录')
+        checked(call(operation, 18, [PTR, PTR], item, c.byref(sink)), '提交回收操作')
+        checked(call(operation, 21, []), '回收操作')
+        aborted = c.c_int32()
+        checked(call(operation, 22, [c.POINTER(c.c_int32)], c.byref(aborted)), '核对回收结果')
+        if aborted.value or state['error'] is not None or not state['recycled'] or os.path.lexists(native_path(path)):
+            raise OSError('系统未确认完成回收，旧副本或剩余内容保留；不会自动永久删除。')
+        return state['path']
+    finally:
+        if item:
+            call(item, 2, [])
+        if operation:
+            call(operation, 2, [])
+        ole.CoUninitialize()
+
+
 def trash_path(path, hard=False):
     """把目录移入系统废纸篓/回收站；hard=True 时永久删除。返回描述字符串。
     这是"删除"操作的唯一推荐实现——个人文件永远先进废纸篓，可反悔。"""
@@ -136,14 +245,8 @@ def trash_path(path, hard=False):
             return '已移入目标卷废纸篓: ' + path
         return "已移入废纸篓: " + target
     if os.name == "nt":
-        ps = ("Add-Type -AssemblyName Microsoft.VisualBasic; "
-              "[Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory('%s',"
-              "'OnlyErrorDialogs','SendToRecycleBin')" % path.replace("'", "''"))
-        r = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
-                           capture_output=True, text=True, errors="replace")
-        if r.returncode == 0:
-            return "已移入回收站: " + path
-        raise RuntimeError("移入回收站失败(%s)。如确认要永久删除请加 --hard-delete" % ((r.stderr or "").strip()[:200]))
+        windows_recycle(path)
+        return "已移入回收站: " + path
     for tool, extra in (("gio", ["trash"]), ("trash-put", [])):
         exe = shutil.which(tool)
         if exe:
@@ -397,8 +500,14 @@ def locked(func):
     @functools.wraps(func)
     def wrapped(args):
         require_supported()
-        with operation_lock():
-            return func(args)
+        global _IO_WORKERS
+        previous = _IO_WORKERS
+        _IO_WORKERS = worker_count(getattr(args, 'workers', 4))
+        try:
+            with operation_lock():
+                return func(args)
+        finally:
+            _IO_WORKERS = previous
     return wrapped
 
 
@@ -473,48 +582,92 @@ def identity(path):
     return [st.st_dev, st.st_ino]
 
 
+def worker_count(value):
+    if not isinstance(value, int) or isinstance(value, bool) or not 1 <= value <= 8:
+        raise SafeAbort('并发数需为 1–8；机械盘可用 --workers 1。')
+    return value
+
+
+def bounded_results(function, items, workers=None):
+    """任务队列最多 2×并发数；异常时停止提交，等待在途写入退出。"""
+    workers = worker_count(_IO_WORKERS if workers is None else workers)
+    iterator = iter(items)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        pending = collections.deque()
+        try:
+            for _ in range(workers * 2):
+                item = next(iterator, None)
+                if item is None:
+                    break
+                pending.append(pool.submit(function, item))
+            while pending:
+                yield pending.popleft().result()
+                item = next(iterator, None)
+                if item is not None:
+                    pending.append(pool.submit(function, item))
+        finally:
+            for future in pending:
+                future.cancel()
+
+
+def file_hash(path, record, progress):
+    digest = hashlib.sha256()
+    with open(path, 'rb') as f:
+        if signature(os.fstat(f.fileno())) != record['signature']:
+            raise SafeAbort('读取前文件发生变化: ' + display_path(path))
+        while True:
+            chunk = f.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+            progress.update(size=len(chunk))
+        if signature(os.fstat(f.fileno())) != record['signature']:
+            raise SafeAbort('读取期间文件发生变化: ' + display_path(path))
+    if signature(os.lstat(path)) != record['signature']:
+        raise SafeAbort('读取后文件发生变化: ' + display_path(path))
+    return digest.hexdigest()
+
+
 def manifest(path, hashes=False, label='扫描目录'):
-    """不跟随目录链接；目录、链接、内容均纳入校验，读取失败一律报错。"""
+    """目录链接不跟随；用扫描项自带 stat，避免每个普通文件重复系统查询。"""
     path = native_path(path)
     if not os.path.isdir(path):
-        raise SafeAbort('数据目录不可访问: ' + path)
+        raise SafeAbort('数据目录不可访问: ' + display_path(path))
     root_stat = os.stat(path)
     out = {'.': {'kind': 'dir', 'mode': statmod.S_IMODE(root_stat.st_mode), 'signature': signature(root_stat)}}
-    with Progress(label) as progress:
+    with Progress(label + ('（扫描）' if hashes else '')) as progress:
         def visit(folder):
             with os.scandir(folder) as iterator:
                 entries = sorted(iterator, key=lambda e: e.name)
             for entry in entries:
                 rel = os.path.relpath(entry.path, path)
-                st = os.lstat(entry.path)
-                if entry.is_symlink():
+                st = entry.stat(follow_symlinks=False)
+                if statmod.S_ISLNK(st.st_mode):
                     record = {'kind': 'link', 'target': os.readlink(entry.path),
                               'directory': bool(getattr(st, 'st_file_attributes', 0) & 0x10) if os.name == 'nt' else False}
-                elif is_reparse_dir(entry.path):
+                elif statmod.S_ISDIR(st.st_mode) and bool(getattr(st, 'st_file_attributes', 0) & 0x400):
                     record = {'kind': 'junction', 'target': display_path(os.path.realpath(entry.path))}
                 elif statmod.S_ISDIR(st.st_mode):
                     record = {'kind': 'dir', 'mode': statmod.S_IMODE(st.st_mode)}
                     visit(entry.path)
                 elif statmod.S_ISREG(st.st_mode):
                     record = {'kind': 'file', 'size': st.st_size, 'mode': statmod.S_IMODE(st.st_mode)}
-                    if hashes:
-                        digest = hashlib.sha256()
-                        with open(entry.path, 'rb') as f:
-                            while True:
-                                chunk = f.read(4 * 1024 * 1024)
-                                if not chunk:
-                                    break
-                                digest.update(chunk)
-                                progress.update(size=len(chunk))
-                        record['sha256'] = digest.hexdigest()
-                        if signature(os.lstat(entry.path)) != signature(st):
-                            raise SafeAbort('校验时文件发生变化: ' + entry.path)
                 else:
-                    raise SafeAbort('不支持的特殊文件（如 socket/FIFO）: ' + entry.path)
+                    raise SafeAbort('不支持的特殊文件（如 socket/FIFO）: ' + display_path(entry.path))
                 record['signature'] = signature(st)
                 out[rel] = record
                 progress.update(count=1)
         visit(path)
+    if hashes:
+        files = [(name, record) for name, record in out.items() if record['kind'] == 'file']
+        with Progress(label, sum(record['size'] for _, record in files), len(files)) as progress:
+            def hash_one(item):
+                name, record = item
+                digest = file_hash(tree_path(path, name), record, progress)
+                progress.update(count=1)
+                return name, digest
+            for name, digest in bounded_results(hash_one, files):
+                out[name]['sha256'] = digest
     return out
 
 
@@ -542,10 +695,12 @@ def tree_path(root, relative):
     return root if relative == '.' else os.path.join(root, relative)
 
 
-def run_copy(src, dest):
+def run_copy(src, dest, records=None):
+    global _COPY_RECEIPT
+    _COPY_RECEIPT = None
     """通用流式复制，四个平台采用相同计数与校验语义，无外部复制工具依赖。"""
     src, dest = native_path(src), native_path(dest)
-    records = manifest(src, label='[2/6] 扫描待复制数据')
+    records = records if records is not None else manifest(src, label='[2/6] 扫描待复制数据')
     total = sum(r.get('size', 0) for r in records.values())
     os.makedirs(dest, mode=0o700, exist_ok=True)
     # 调用方只传入本工具创建并记录的 staging；清理上次中断的多余副本条目。
@@ -562,56 +717,85 @@ def run_copy(src, dest):
             os.rmdir(path)
         else:
             os.unlink(path)
-    with Progress('[2/6] 正在复制', total, len(records)) as progress:
+    print('复制与 SHA-256 源摘要合并执行；%d 路并发，保留逐文件落盘。' % _IO_WORKERS, flush=True)
+    files = []
+    with Progress('[2/6] 复制并计算源摘要', total, len(records)) as progress:
         for rel, record in sorted(records.items(), key=lambda item: (item[0].count(os.sep), item[0])):
-            s, d = tree_path(src, rel), tree_path(dest, rel)
-            os.makedirs(os.path.dirname(d), mode=0o700, exist_ok=True)
+            d = tree_path(dest, rel)
             kind = record['kind']
+            if kind == 'file':
+                files.append((rel, record))
+                continue
             if kind == 'dir':
+                if link_target(d) is not None:
+                    raise SafeAbort('拒绝写入临时副本内的目录链接: ' + display_path(d))
                 os.makedirs(d, mode=0o700, exist_ok=True)
-            elif kind in ('link', 'junction'):
+            else:
                 if os.path.lexists(d):
                     if link_target(d) is None:
-                        raise SafeAbort('临时副本中已有非链接条目: ' + d)
+                        raise SafeAbort('临时副本中已有非链接条目: ' + display_path(d))
                     remove_link(d)
                 if kind == 'junction':
                     make_link(record['target'], d)
                 else:
                     os.symlink(record['target'], d, target_is_directory=record['directory'])
-            else:
-                if os.path.islink(d) or is_reparse_dir(d):
-                    raise SafeAbort('拒绝写入临时副本内的链接: ' + d)
-                # 固定短文件名，避免长原文件名再附加后缀超过单组件限制。
-                temporary = os.path.join(os.path.dirname(d), '.wb-file-' + uuid.uuid4().hex + '.tmp')
-                try:
-                    with open(s, 'rb') as source, open(temporary, 'xb') as target:
-                        while True:
-                            chunk = source.read(4 * 1024 * 1024)
-                            if not chunk:
-                                break
-                            target.write(chunk)
-                            progress.update(size=len(chunk))
-                        target.flush()
-                        os.fsync(target.fileno())
-                    if signature(os.lstat(s)) != record['signature']:
-                        raise SafeAbort('复制期间源文件发生变化: ' + s)
-                    shutil.copystat(s, temporary, follow_symlinks=False)
-                    os.replace(temporary, d)
-                except OSError as ex:
-                    raise SafeAbort('复制文件失败: %s\n源文件: %s\n目标文件: %s' %
-                                    (ex, display_path(s), display_path(d))) from ex
-                finally:
-                    if os.path.exists(temporary):
-                        os.unlink(temporary)
             progress.update(count=1)
+        def copy_one(item):
+            rel, record = item
+            s, d = tree_path(src, rel), tree_path(dest, rel)
+            if os.path.islink(d) or is_reparse_dir(d):
+                raise SafeAbort('拒绝写入临时副本内的链接: ' + display_path(d))
+            temporary = os.path.join(os.path.dirname(d), '.wb-file-' + uuid.uuid4().hex + '.tmp')
+            digest = hashlib.sha256()
+            try:
+                with open(s, 'rb') as source, open(temporary, 'xb') as target:
+                    if signature(os.fstat(source.fileno())) != record['signature']:
+                        raise SafeAbort('复制前源文件发生变化: ' + display_path(s))
+                    while True:
+                        chunk = source.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        target.write(chunk)
+                        digest.update(chunk)
+                        progress.update(size=len(chunk))
+                    target.flush()
+                    os.fsync(target.fileno())
+                    if signature(os.fstat(source.fileno())) != record['signature']:
+                        raise SafeAbort('复制期间源文件发生变化: ' + display_path(s))
+                if signature(os.lstat(s)) != record['signature']:
+                    raise SafeAbort('复制后源文件发生变化: ' + display_path(s))
+                shutil.copystat(s, temporary, follow_symlinks=False)
+                os.replace(temporary, d)
+            except OSError as ex:
+                raise SafeAbort('复制文件失败: %s\n源文件: %s\n目标文件: %s' %
+                                (ex, display_path(s), display_path(d))) from ex
+            finally:
+                if os.path.exists(temporary):
+                    os.unlink(temporary)
+            progress.update(count=1)
+            return rel, digest.hexdigest()
+        for rel, digest in bounded_results(copy_one, files):
+            records[rel]['sha256'] = digest
         for rel, record in sorted(records.items(), key=lambda item: -1 if item[0] == '.' else item[0].count(os.sep), reverse=True):
             if record['kind'] == 'dir':
                 shutil.copystat(tree_path(src, rel), tree_path(dest, rel), follow_symlinks=False)
+    _COPY_RECEIPT = dict(src=canonical(src), dest=canonical(dest), source_id=identity(src),
+                         dest_id=identity(dest), records=records)
     return 'python-stream'
 
 
 def verify_strict(src, dest):
-    source = manifest(src, hashes=True, label='[3/6] 校验源文件内容')
+    global _COPY_RECEIPT
+    receipt, _COPY_RECEIPT = _COPY_RECEIPT, None
+    if (receipt and receipt['src'] == canonical(src) and receipt['dest'] == canonical(dest)
+            and receipt['source_id'] == identity(src) and receipt['dest_id'] == identity(dest)):
+        source = receipt['records']
+        snapshot = {name: {k: v for k, v in record.items() if k != 'sha256'} for name, record in source.items()}
+        if manifest(src, label='[3/6] 核对源目录状态') != snapshot:
+            raise SafeAbort('复制后源目录发生变化，已停止。')
+        print('使用本次复制读取时的源 SHA-256，避免再次完整读取源盘。', flush=True)
+    else:
+        source = manifest(src, hashes=True, label='[3/6] 校验源文件内容')
     target = manifest(dest, hashes=True, label='[3/6] 校验副本内容')
     s, d = content_manifest(source), content_manifest(target)
     missing, extra = set(s) - set(d), set(d) - set(s)
@@ -994,13 +1178,15 @@ def cmd_migrate(args):
     plan['volume'] = volume
     try:
         transition(plan, 'copying')
-        size, count, _ = tree_stats(data)
+        source_records = manifest(data, label='扫描待复制目录')
+        size = sum(r.get('size', 0) for r in source_records.values())
+        count = len(source_records) - 1
         print('数据: %s / %d 项；目标: %s' % (fmt_bytes(size), count, dest), flush=True)
         if not reuse and shutil.disk_usage(os.path.dirname(dest)).free < size * 1.02:
             raise SafeAbort('目标剩余空间不足（需要数据体积加 2% 余量）。')
         candidate = dest if reuse else plan['staging']
         if not reuse:
-            run_copy(data, candidate)
+            run_copy(data, candidate, records=source_records)
         transition(plan, 'verifying')
         if not verify_strict(data, candidate):
             raise SafeAbort('内容校验失败。原始数据保持完整，副本保留供检查。')
@@ -1075,11 +1261,12 @@ def move_dest_back(src, dest, plan=None, manage=True):
     if plan is None:
         plan = new_operation('restore', src, dest, dest)
     stage = plan['staging']
-    size, _, _ = tree_stats(dest)
+    source_records = manifest(dest, label='扫描待恢复目录')
+    size = sum(r.get('size', 0) for r in source_records.values())
     if shutil.disk_usage(os.path.dirname(src)).free < size * 1.02:
         raise SafeAbort('原磁盘空间不足；原链接未改变。')
     transition(plan, 'copying')
-    run_copy(dest, stage)
+    run_copy(dest, stage, records=source_records)
     transition(plan, 'verifying')
     if not verify_strict(dest, stage):
         raise SafeAbort('恢复副本校验失败；原链接未改变。')
@@ -1095,7 +1282,7 @@ def move_dest_back(src, dest, plan=None, manage=True):
         if not os.path.lexists(src):
             make_link(dest, src)
         raise
-    transition(plan, 'committed', source_usable=True, swapped=False)
+    transition(plan, 'committed', source_usable=True, swapped=False, restored_identity=identity(src))
     return 'copy', '最新数据已校验并迁回；原实际位置仍保留到清理阶段。'
 
 
@@ -1251,13 +1438,19 @@ def cmd_cleanup_backup(args):
     target = resolved_link(src)
     if not os.path.isdir(src) or (target and not same_path(target, dest)):
         raise SafeAbort('当前原路径状态与记录不符，拒绝清理。')
-    obsolete = plan.get('old_target') or plan['backup']
+    restored = plan.get('action') in ('restore', 'rollback')
+    obsolete = plan['dest'] if restored else (plan.get('old_target') or plan['backup'])
+    if restored and (target is not None or plan.get('stage') != 'complete'):
+        raise SafeAbort('尚未确认恢复完成，拒绝清理旧位置。')
+    if restored and plan.get('restored_identity') and identity(src) != plan['restored_identity']:
+        raise SafeAbort('已恢复目录身份发生变化，拒绝清理旧位置。')
     if os.path.isdir(obsolete):
-        if same_path(obsolete, src) or same_path(obsolete, dest):
+        if same_path(obsolete, src) or (not restored and same_path(obsolete, dest)):
             raise SafeAbort('待清理位置仍是当前数据，拒绝删除。')
         if not plan.get('source_digest') or manifest_digest(manifest(obsolete, hashes=True, label='确认旧副本身份')) != plan['source_digest']:
             raise SafeAbort('旧副本身份无法确认或内容已变化，拒绝自动清理。请人工检查。')
-        print(trash_path(obsolete, hard=args.hard_delete), flush=True)
+        with Progress('[5/6] 仅清理旧副本'):
+            print(trash_path(obsolete, hard=args.hard_delete), flush=True)
     else:
         print('旧副本已不存在。', flush=True)
     plan.update(backup_removed=True, obsolete_removed=True)
@@ -1376,13 +1569,19 @@ def report_result(rc, log_path, failure=None):
         print('原路径当前可访问: %s' % os.path.isdir(_ACTIVE['src']), flush=True)
         if rc not in (0, 2):
             print('下一步: 先 detect；未完成记录使用 recover。不要删除源目录或副本。', flush=True)
+    if rc == 2:
+        print('数据操作已完成；待处理提醒如下：', flush=True)
+        for message in _WARNINGS:
+            print('  - ' + message, flush=True)
+        if _ACTIVE and _ACTIVE.get('action') in ('restore', 'rollback'):
+            print('无需重跑恢复；仅清理旧位置可用新版 cleanup-backup --plan "%s" --yes。' % _ACTIVE['plan_path'], flush=True)
     print('结束: %s\n日志: %s' % (now_iso(), log_path), flush=True)
     return rc
 
 
 def execute_logged(action, log_dir=None):
-    global _ACTIVE, _WARNINGS
-    _ACTIVE, _WARNINGS = None, []
+    global _ACTIVE, _WARNINGS, _COPY_RECEIPT
+    _ACTIVE, _WARNINGS, _COPY_RECEIPT = None, [], None
     log_dir = os.path.abspath(os.path.expanduser(log_dir or default_log_dir()))
     os.makedirs(log_dir, exist_ok=True)
     path = os.path.join(log_dir, 'run-%s-%s.log' % (datetime.datetime.now().strftime('%Y%m%d-%H%M%S-%f'), os.getpid()))
@@ -1419,7 +1618,7 @@ def cmd_run_job(args):
         with open(args.args_file, encoding='utf-8') as f:
             job = json.load(f)
         command = job.get('command', 'migrate')
-        common = dict(no_relaunch=False, force_any_dir=False)
+        common = dict(no_relaunch=False, force_any_dir=False, workers=worker_count(job.get('workers', 4)))
         if command == 'migrate':
             if not job.get('dest_base'):
                 raise ValueError('Job is missing dest_base')
@@ -1537,6 +1736,7 @@ def cmd_make_runner(args):
         job_name = 'runner-%s-args.json' % command
     payload['keep_backup'] = getattr(args, 'keep_backup', False)
     payload['python_executable'] = python_executable
+    payload['workers'] = worker_count(getattr(args, 'workers', 4))
     suffix = '.bat' if os.name == 'nt' else ('.command' if sys.platform == 'darwin' else '.sh')
     out = os.path.abspath(os.path.expanduser(args.out or os.path.join(PLAN_DIR, 'run_' + command + suffix)))
     folder = os.path.dirname(out)
@@ -1573,6 +1773,7 @@ def main():
     mg.add_argument('--skip-app-handling', action='store_true', help='仅允许非默认测试目录')
     mg.add_argument('--no-relaunch', action='store_true')
     mg.add_argument('--keep-backup', action='store_true')
+    mg.add_argument('--workers', type=int, choices=range(1, 9), default=4)
     mg.set_defaults(func=cmd_migrate)
     runner = sub.add_parser('make-runner')
     runner.add_argument('--command', choices=['migrate', 'restore', 'rollback', 'recover'], default='migrate')
@@ -1582,6 +1783,7 @@ def main():
     runner.add_argument('--out')
     runner.add_argument('--python', dest='python_executable', help='指定数据目录之外的现有系统/便携 Python，生成唯一入口')
     runner.add_argument('--keep-backup', action='store_true')
+    runner.add_argument('--workers', type=int, choices=range(1, 9), default=4, help='复制/校验并发数；机械盘建议从 1 开始')
     runner.set_defaults(func=cmd_make_runner)
     job = sub.add_parser('run-job')
     job.add_argument('--args-file', required=True)
@@ -1595,6 +1797,7 @@ def main():
         parser.add_argument('--keep-backup', action='store_true')
         parser.add_argument('--hard-delete', action='store_true')
         parser.add_argument('--yes', action='store_true')
+        parser.add_argument('--workers', type=int, choices=range(1, 9), default=4)
         parser.set_defaults(func=func)
     args = p.parse_args()
     if args.cmd == 'run-job':
