@@ -19,6 +19,7 @@ import shutil
 import signal
 import shlex
 import stat as statmod
+import struct
 import subprocess
 import sys
 import tempfile
@@ -41,6 +42,8 @@ _COPY_ENGINE = 'auto'
 _COPY_EXE = None
 _CLEANUP_ENGINE = 'auto'
 _DISPLAY = 'auto'
+_PERMISSION_REPAIR = 'ask'
+_PROMPTING = threading.Event()
 NATIVE_WINDOWS = sys.platform == 'win32'
 FORCE_SIGNAL = getattr(signal, 'SIGKILL', 9)
 STAGES = {'prepared': '准备', 'copying': '复制数据', 'verifying': '内容校验',
@@ -123,6 +126,17 @@ def recycle_precheck(flags):
     return 0 if flags & 0x80 else -2147467259
 
 
+class RecycleError(OSError):
+    def __init__(self, hr, stage, path):
+        self.hresult, self.path = hr & 0xffffffff, path
+        reasons = {0x80270021: '源旧副本访问被拒绝，需检查删除权限',
+                   0x80270002: '操作需要提升权限', 0x80270027: '源文件仍被进程占用',
+                   0x8027003F: '文件带有只读属性', 0x80270037: '副本超过回收站容量',
+                   0x80270038: '回收站路径过长'}
+        super().__init__('%s失败（HRESULT 0x%08X）：%s；路径: %s。旧副本或剩余内容保留，未尝试永久删除。' %
+                         (stage, self.hresult, reasons.get(self.hresult, 'Windows 回收接口报错'), path))
+
+
 def windows_recycle(path):
     """直接使用 Windows Shell IFileOperation；不依赖 PowerShell/.NET UI 环境。"""
     import ctypes as c
@@ -151,13 +165,13 @@ def windows_recycle(path):
     shell.SHCreateItemFromParsingName.restype = HRESULT
     def checked(hr, stage):
         if hr < 0:
-            raise OSError('%s失败（HRESULT 0x%08X）；旧副本或剩余内容保留，未尝试永久删除。' % (stage, hr & 0xffffffff))
+            raise RecycleError(hr, stage, path)
     def call(ptr, index, types, *args):
         table = c.cast(ptr, c.POINTER(c.POINTER(PTR))).contents
         return c.WINFUNCTYPE(HRESULT, PTR, *types)(table[index])(ptr, *args)
     checked(ole.CoInitializeEx(None, 2), '初始化回收站接口')
     operation, item = PTR(), PTR()
-    state = {'references': 1, 'recycled': 0, 'path': None, 'error': None, 'blocked': False}
+    state = {'references': 1, 'recycled': 0, 'path': None, 'error': None, 'failed_path': path, 'blocked': False}
     callbacks = []
     class Sink(c.Structure):
         _fields_ = [('table', c.POINTER(PTR))]
@@ -184,6 +198,10 @@ def windows_recycle(path):
     def after_delete(this, flags, original, hr, new_item):
         if hr < 0:
             state['error'] = hr
+            name = PTR()
+            if original and call(original, 5, [UINT, c.POINTER(PTR)], 0x80058000, c.byref(name)) >= 0 and name:
+                state['failed_path'] = c.wstring_at(name)
+                ole.CoTaskMemFree(name)
         elif new_item:
             state['recycled'] += 1
             name = PTR()
@@ -216,6 +234,8 @@ def windows_recycle(path):
         performed = call(operation, 21, [])
         if state['blocked']:
             raise OSError('Windows 要求对部分条目永久删除，已拒绝该降级；旧副本或剩余内容保留。')
+        if state['error'] is not None:
+            raise RecycleError(state['error'], '回收条目', state['failed_path'])
         checked(performed, '回收操作')
         aborted = c.c_int32()
         checked(call(operation, 22, [c.POINTER(c.c_int32)], c.byref(aborted)), '核对回收结果')
@@ -228,6 +248,348 @@ def windows_recycle(path):
         if operation:
             call(operation, 2, [])
         ole.CoUninitialize()
+
+
+DELETE_DENY_BITS = 0x00010040  # DELETE + FILE_DELETE_CHILD；不修改其他拒绝位。
+
+
+def acl_entries(raw):
+    if len(raw) < 8:
+        raise OSError('无法识别 DACL，保留权限。')
+    revision, reserved, length, count, reserved2 = struct.unpack_from('<BBHHH', raw)
+    if length != len(raw):
+        raise OSError('DACL 长度无效，保留权限。')
+    entries, offset = [], 8
+    for _ in range(count):
+        if offset + 4 > length:
+            raise OSError('DACL 条目不完整。')
+        size = struct.unpack_from('<H', raw, offset + 2)[0]
+        if size < 4 or offset + size > length:
+            raise OSError('DACL 条目长度无效。')
+        entries.append(raw[offset:offset + size]); offset += size
+    return (revision, reserved, reserved2), entries
+
+
+def delete_deny(ace, sid):
+    # 仅支持当前用户的标准 ACCESS_DENIED_ACE；条件/对象/其他账号规则保留。
+    return (len(ace) >= 16 and ace[0] == 1 and
+            ace[8:8 + 8 + 4 * ace[9]] == sid and
+            bool(struct.unpack_from('<I', ace, 4)[0] & DELETE_DENY_BITS))
+
+
+def without_delete_denies(raw, sid):
+    header, entries = acl_entries(raw)
+    kept = []
+    for ace in entries:
+        if delete_deny(ace, sid):
+            mask = struct.unpack_from('<I', ace, 4)[0] & ~DELETE_DENY_BITS
+            if not mask:
+                continue
+            ace = ace[:4] + struct.pack('<I', mask) + ace[8:]
+        kept.append(ace)
+    if kept == entries:
+        return raw
+    body = b''.join(kept)
+    return struct.pack('<BBHHH', header[0], header[1], 8 + len(body), len(kept), header[2]) + body
+
+
+class WindowsACL:
+    """句柄读取与定点修改 DACL；不接管所有权，不打开提权窗口。"""
+    def __init__(self):
+        import ctypes as c
+        self.c = c
+        self.k = c.WinDLL('kernel32', use_last_error=True)
+        self.a = c.WinDLL('advapi32', use_last_error=True)
+        P, D, W, B = c.c_void_p, c.c_uint32, c.c_wchar_p, c.c_int32
+        def bind(dll, name, args, result):
+            f = getattr(dll, name); f.argtypes, f.restype = args, result
+        bind(self.k, 'CreateFileW', [W, D, D, P, D, D, P], P)
+        bind(self.k, 'GetCurrentProcess', [], P)
+        bind(self.k, 'CloseHandle', [P], B)
+        bind(self.k, 'LocalFree', [P], P)
+        bind(self.a, 'OpenProcessToken', [P, D, c.POINTER(P)], B)
+        bind(self.a, 'GetTokenInformation', [P, D, P, D, c.POINTER(D)], B)
+        bind(self.a, 'GetLengthSid', [P], D)
+        bind(self.a, 'ConvertSidToStringSidW', [P, c.POINTER(P)], B)
+        bind(self.a, 'LookupAccountSidW', [W, P, W, c.POINTER(D), W, c.POINTER(D), c.POINTER(D)], B)
+        bind(self.a, 'GetSecurityInfo', [P, D, D, P, P, c.POINTER(P), P, c.POINTER(P)], D)
+        bind(self.a, 'SetSecurityInfo', [P, D, D, P, P, P, P], D)
+        class Info(c.Structure):
+            _fields_ = [('attributes', D), ('created', D * 2), ('accessed', D * 2),
+                        ('written', D * 2), ('volume', D), ('size_high', D), ('size_low', D),
+                        ('links', D), ('index_high', D), ('index_low', D)]
+        self.Info = Info
+        bind(self.k, 'GetFileInformationByHandle', [P, c.POINTER(Info)], B)
+        token = P()
+        if not self.a.OpenProcessToken(self.k.GetCurrentProcess(), 8, c.byref(token)):
+            raise c.WinError(c.get_last_error())
+        try:
+            needed = D()
+            self.a.GetTokenInformation(token, 1, None, 0, c.byref(needed))
+            buffer = c.create_string_buffer(needed.value)
+            if not self.a.GetTokenInformation(token, 1, buffer, needed, c.byref(needed)):
+                raise c.WinError(c.get_last_error())
+            sid = c.cast(buffer, c.POINTER(P))[0]
+            self.sid = c.string_at(sid, self.a.GetLengthSid(sid))
+            name, domain, ns, ds, use = c.create_unicode_buffer(256), c.create_unicode_buffer(256), D(256), D(256), D()
+            if self.a.LookupAccountSidW(None, sid, name, c.byref(ns), domain, c.byref(ds), c.byref(use)):
+                self.account = domain.value + '\\' + name.value
+            else:
+                text_sid = P()
+                if not self.a.ConvertSidToStringSidW(sid, c.byref(text_sid)):
+                    raise c.WinError(c.get_last_error())
+                try:
+                    self.account = c.wstring_at(text_sid)
+                finally:
+                    self.k.LocalFree(text_sid)
+            elevation = D()
+            self.elevated = (bool(elevation.value) if self.a.GetTokenInformation(
+                token, 20, c.byref(elevation), c.sizeof(elevation), c.byref(needed)) else None)
+        finally:
+            self.k.CloseHandle(token)
+
+    @contextlib.contextmanager
+    def opened(self, path, access=0x00020000):
+        c = self.c
+        # 不跟随最终 reparse point；不共享删除，保持已打开对象身份。
+        handle = self.k.CreateFileW(native_path(path), access, 3, None, 3, 0x02200000, None)
+        if handle == c.c_void_p(-1).value:
+            raise c.WinError(c.get_last_error())
+        try:
+            info = self.Info()
+            if not self.k.GetFileInformationByHandle(handle, c.byref(info)):
+                raise c.WinError(c.get_last_error())
+            if info.attributes & 0x400:
+                raise OSError('链接/reparse point 不参与权限修改: ' + path)
+            if not info.attributes & 0x10 and info.links > 1:
+                raise OSError('多硬链接文件不参与权限修改: ' + path)
+            yield handle, info
+        finally:
+            self.k.CloseHandle(handle)
+
+    def read_handle(self, handle, info):
+        c = self.c; dacl, descriptor = c.c_void_p(), c.c_void_p()
+        error = self.a.GetSecurityInfo(handle, 1, 4, None, None, c.byref(dacl), None, c.byref(descriptor))
+        if error:
+            raise c.WinError(error)
+        try:
+            raw = c.string_at(dacl, c.c_uint16.from_address(dacl.value + 2).value) if dacl else b''
+            if raw:
+                acl_entries(raw)
+            return {'acl': raw.hex(), 'identity': [info.volume, info.index_high, info.index_low],
+                    'attributes': info.attributes}
+        finally:
+            self.k.LocalFree(descriptor)
+
+    def read(self, path):
+        with self.opened(path) as (handle, info):
+            return self.read_handle(handle, info)
+
+    def set_handle(self, handle, raw):
+        acl_entries(raw)  # 禁止 NULL DACL 或无效缓冲区。
+        buffer = self.c.create_string_buffer(raw)
+        error = self.a.SetSecurityInfo(handle, 1, 4, None, None, buffer, None)
+        if error:
+            raise self.c.WinError(error)
+
+    def repair(self, path, expected):
+        # MAXIMUM_ALLOWED 句柄使 SetSecurityInfo 不自动传播到子对象。
+        # 每个已预览对象单独修改，避免目录中的 junction 指向当前数据时被改权限。
+        with self.opened(path, 0x02000000) as (handle, info):
+            current = self.read_handle(handle, info)
+            if current != expected:
+                raise OSError('对象身份、属性或权限在确认后发生变化，停止修改: ' + path)
+            replacement = without_delete_denies(bytes.fromhex(current['acl']), self.sid)
+            self.set_handle(handle, replacement)
+            actual = self.read_handle(handle, info)
+            if actual['acl'] != replacement.hex():
+                raise OSError('系统未确认权限修改结果，停止重试回收: ' + path)
+
+
+def guarded_permission_path(root, path):
+    # 文字范围 + 逐级 lstat；禁止穿过链接、挂载点或非目录祖先。
+    root, path = os.path.abspath(root), os.path.abspath(path)
+    if os.path.commonpath([root, path]) != root:
+        raise OSError('权限修改路径超出旧副本范围。')
+    current = root
+    parts = os.path.relpath(path, root).split(os.sep)
+    for part in ['.'] + ([] if parts == ['.'] else parts):
+        if part != '.':
+            current = os.path.join(current, part)
+        st = os.lstat(native_path(current))
+        if statmod.S_ISLNK(st.st_mode) or getattr(st, 'st_file_attributes', 0) & 0x400:
+            raise OSError('权限修改路径含链接/reparse point，已跳过: ' + current)
+        if current != path and not statmod.S_ISDIR(st.st_mode):
+            raise OSError('权限修改路径的祖先不是目录。')
+
+
+def permission_scope(path):
+    plan = _ACTIVE
+    if not plan or not plan.get('verified') or plan.get('stage') not in ('cleanup', 'complete'):
+        raise OSError('无已完成切换的阶段记录，仅报告权限问题，不修改。')
+    expected = ([plan['dest'], plan['backup']] if plan.get('action') in ('restore', 'rollback')
+                else [plan.get('old_target') or plan['backup']])
+    if not any(p and os.path.normcase(os.path.abspath(p)) == os.path.normcase(os.path.abspath(path)) for p in expected):
+        raise OSError('不是本次记录的旧副本，仅报告权限问题，不修改。')
+    guard_common(path)
+    current = resolved_link(plan['src']) or plan['src']
+    if not os.path.isdir(plan['src']) or is_within(path, current) or is_within(current, path):
+        raise OSError('旧副本与当前数据范围重叠或当前路径不可用，拒绝修改。')
+    guarded_permission_path(path, path)
+
+
+def permission_probe(root, api, seconds=8, directory_limit=2000, file_limit=256):
+    """先查目录的显式拒绝来源；有界抽样，不因诊断再逐一读取全部文件 ACL。"""
+    queue = collections.deque([root]); hits, errors = [], []
+    start, dirs, files = time.monotonic(), 0, 0
+    limited = False
+    def inspect(path):
+        try:
+            guarded_permission_path(root, path)
+            item = api.read(path)
+            if item['acl'] and without_delete_denies(bytes.fromhex(item['acl']), api.sid).hex() != item['acl']:
+                hits.append(path)
+        except OSError as ex:
+            if len(errors) < 8:
+                errors.append(str(ex))
+    while queue:
+        if dirs >= directory_limit or time.monotonic() - start >= seconds:
+            limited = True; break
+        path = queue.popleft(); dirs += 1
+        inspect(path)
+        children = []
+        try:
+            guarded_permission_path(root, path)
+            with os.scandir(native_path(path)) as entries:
+                for entry in entries:
+                    if time.monotonic() - start >= seconds:
+                        limited = True; break
+                    name = os.path.join(path, entry.name)
+                    st = entry.stat(follow_symlinks=False)
+                    if statmod.S_ISLNK(st.st_mode) or getattr(st, 'st_file_attributes', 0) & 0x400:
+                        continue
+                    if statmod.S_ISDIR(st.st_mode):
+                        children.append(name)
+                    elif files < file_limit:
+                        files += 1; inspect(name)
+        except OSError as ex:
+            if len(errors) < 8:
+                errors.append(str(ex))
+        # 日志是已观察到的拒绝来源，优先查；不限定只能处理日志。
+        children.sort(key=lambda p: (os.path.basename(p).lower() != 'logs', p.lower()))
+        queue.extend(children)
+    roots = []
+    for path in sorted(hits, key=lambda p: (len(p), p)):
+        if not any(is_within(parent, path) for parent in roots):
+            roots.append(path)
+    return roots, {'directories_checked': dirs, 'files_sampled': files, 'limited': limited,
+                   'errors': errors}
+
+
+def permission_changes(root, candidates, api, limit=20000, seconds=15):
+    queue, changes = collections.deque(candidates), []
+    start, count = time.monotonic(), 0
+    while queue:
+        if count >= limit or time.monotonic() - start >= seconds:
+            raise OSError('拟修复范围超过有界检查限制，保留旧副本；可人工检查具体受阻子目录。')
+        path = queue.popleft(); count += 1
+        guarded_permission_path(root, path)
+        item = api.read(path)
+        if item['acl'] and without_delete_denies(bytes.fromhex(item['acl']), api.sid).hex() != item['acl']:
+            changes.append(dict(path=path, before=item))
+        if item['attributes'] & 0x10:
+            with os.scandir(native_path(path)) as entries:
+                for entry in entries:
+                    st = entry.stat(follow_symlinks=False)
+                    if statmod.S_ISLNK(st.st_mode) or getattr(st, 'st_file_attributes', 0) & 0x400:
+                        continue
+                    queue.append(os.path.join(path, entry.name))
+                    if count + len(queue) > limit or time.monotonic() - start >= seconds:
+                        raise OSError('拟修复范围超过有界检查限制，保留旧副本。')
+    return changes
+
+
+def authorize_permission_repair(report_path, report):
+    print('\n旧副本存在当前账号的拒绝删除规则。账号: %s；已提权: %s' %
+          (report['account'], report['elevated']), flush=True)
+    print('旧副本: ' + report['root'], flush=True)
+    print('检查/原权限记录: ' + report_path, flush=True)
+    for path in report['candidates'][:10]:
+        print('  受阻位置: ' + path, flush=True)
+    print('拟修改 %d 个文件/目录：仅解除上述账号的 DELETE/DELETE_CHILD 拒绝位，保留其他权限。' %
+          len(report['changes']), flush=True)
+    print('不接管所有权、不修改当前数据、不自动提权；修复后仅重试一次移入回收站。', flush=True)
+    if _PERMISSION_REPAIR != 'ask' or not sys.stdin.isatty() or not sys.stdout.isatty():
+        print('未启用交互或无交互终端：保留旧副本，不修改权限。', flush=True)
+        return False
+    print('授权修改这些旧副本权限？输入 REPAIR 确认；直接 Enter 或其他输入表示保留。', flush=True)
+    try:
+        answer = input('选择: ').strip()
+    except (EOFError, KeyboardInterrupt):
+        print('\n已取消权限修改，旧副本保留。', flush=True)
+        return False
+    allowed = answer == 'REPAIR'
+    print('用户选择: ' + ('REPAIR（明确授权）' if allowed else '保留（未授权）'), flush=True)
+    return allowed
+
+
+def recycle_with_permissions(path):
+    try:
+        return windows_recycle(path)
+    except RecycleError as failure:
+        if failure.hresult not in (0x80270021, 0x80270002):
+            raise
+        _PROMPTING.set()
+        report, report_path = None, None
+        try:
+            permission_scope(path)
+            api = WindowsACL()
+            root_before = api.read(path)
+            candidates, checked = permission_probe(path, api)
+            if not candidates:
+                raise OSError('有界检查未找到可安全解除的当前账号删除拒绝规则；不能据此排除其他权限、占用或系统限制。')
+            changes = permission_changes(path, candidates, api)
+            if not changes:
+                raise OSError('未找到可修改的删除拒绝位，旧副本保留。')
+            report = dict(root=path, account=api.account, sid=api.sid.hex(), elevated=api.elevated,
+                          checked=checked, candidates=candidates, changes=changes, created_at=now_iso(),
+                          status='awaiting_authorization', failure=str(failure))
+            report_path = os.path.join(PLAN_DIR, 'cleanup-permissions-%s-%s.json' %
+                                       (_ACTIVE['id'], uuid.uuid4().hex))
+            atomic_json(report_path, report)
+            _ACTIVE.setdefault('permission_reports', []).append(report_path)
+            save_plan(_ACTIVE)
+            if not authorize_permission_repair(report_path, report):
+                report['status'] = 'kept_without_authorization'; atomic_json(report_path, report)
+                raise OSError('用户未授权权限修改，旧副本保留。检查记录: ' + report_path)
+            report.update(status='authorized', authorized_at=now_iso(), applied=[])
+            atomic_json(report_path, report)  # 写入确认与原权限成功后才能修改。
+            permission_scope(path)
+            if api.read(path) != root_before:
+                raise OSError('旧副本根目录身份或权限在确认后发生变化。')
+            for change in changes:
+                permission_scope(path)
+                guarded_permission_path(path, change['path'])
+                api.repair(change['path'], change['before'])
+                report['applied'].append(change['path'])
+                atomic_json(report_path, report)
+            report['status'] = 'permissions_repaired'; atomic_json(report_path, report)
+            print('已解除 %d 个旧副本对象的删除限制，正在重试回收 ...' % len(changes), flush=True)
+            permission_scope(path)
+            result = windows_recycle(path)  # 不递归进入授权流程，不重试其他删除方式。
+            report['status'] = 'recycled'; atomic_json(report_path, report)
+            return result
+        except Exception as ex:
+            if report and report_path and report.get('status') != 'kept_without_authorization':
+                report.update(status='stopped', error=str(ex), stopped_at=now_iso())
+                try:
+                    atomic_json(report_path, report)
+                except OSError:
+                    pass  # 既有原权限/已应用记录保留；完整异常另存运行日志。
+            # 原始回收错误不能被诊断失败掩盖；权限修改失败也不触发永久删除。
+            raise OSError('%s\n权限检查/处理: %s' % (failure, ex)) from ex
+        finally:
+            _PROMPTING.clear()
 
 
 def cleanup_choices():
@@ -252,7 +614,7 @@ def trash_path(path, hard=False):
     if engine not in cleanup_choices():
         raise UnsupportedEnvironment('当前环境不能使用清理方式: ' + engine)
     if os.name == 'nt':
-        windows_recycle(path)
+        recycle_with_permissions(path)
         return '已移入回收站: ' + path
     if sys.platform == 'darwin':
         if engine in ('auto', 'trash'):
@@ -538,6 +900,8 @@ def validate_settings(args):
     if display not in ('auto', 'plain', 'compact'):
         raise SafeAbort('显示方式无效: ' + str(display))
     tool = getattr(args, 'copy_tool', None)
+    if getattr(args, 'permission_repair', 'ask') not in ('ask', 'off'):
+        raise SafeAbort('权限修复选项仅支持 ask/off，不能预先自动授权。')
     if tool and copy in ('auto', 'python'):
         raise SafeAbort('--copy-tool 只用于显式选择的原生复制工具。')
     return worker_count(getattr(args, 'workers', DEFAULT_IO_WORKERS)), copy, cleanup, display, tool
@@ -547,14 +911,15 @@ def locked(func):
     @functools.wraps(func)
     def wrapped(args):
         require_supported()
-        global _IO_WORKERS, _COPY_ENGINE, _CLEANUP_ENGINE, _DISPLAY, _COPY_EXE
-        previous = _IO_WORKERS, _COPY_ENGINE, _CLEANUP_ENGINE, _DISPLAY, _COPY_EXE
+        global _IO_WORKERS, _COPY_ENGINE, _CLEANUP_ENGINE, _DISPLAY, _COPY_EXE, _PERMISSION_REPAIR
+        previous = _IO_WORKERS, _COPY_ENGINE, _CLEANUP_ENGINE, _DISPLAY, _COPY_EXE, _PERMISSION_REPAIR
         _IO_WORKERS, _COPY_ENGINE, _CLEANUP_ENGINE, _DISPLAY, _COPY_EXE = validate_settings(args)
+        _PERMISSION_REPAIR = getattr(args, 'permission_repair', 'ask')
         try:
             with operation_lock():
                 return func(args)
         finally:
-            _IO_WORKERS, _COPY_ENGINE, _CLEANUP_ENGINE, _DISPLAY, _COPY_EXE = previous
+            _IO_WORKERS, _COPY_ENGINE, _CLEANUP_ENGINE, _DISPLAY, _COPY_EXE, _PERMISSION_REPAIR = previous
     return wrapped
 
 
@@ -573,6 +938,8 @@ class Progress:
             self.bytes += size
 
     def report(self, final=False, force=False, failed=False):
+        if _PROMPTING.is_set():
+            return
         with self.mutex:
             count, size = self.files, self.bytes
         elapsed = max(0, time.monotonic() - self.start)
@@ -1309,7 +1676,7 @@ def check_volume(dest, volume):
 def new_operation(action, src, dest, data, backup=None):
     global _ACTIVE
     op_id = uuid.uuid4().hex
-    plan = {'execution': dict(copy_engine=_COPY_ENGINE, cleanup=_CLEANUP_ENGINE, workers=_IO_WORKERS, display=_DISPLAY), 'version': 2, 'id': op_id, 'action': action, 'method': action,
+    plan = {'execution': dict(copy_engine=_COPY_ENGINE, cleanup=_CLEANUP_ENGINE, workers=_IO_WORKERS, display=_DISPLAY, permission_repair=_PERMISSION_REPAIR), 'version': 2, 'id': op_id, 'action': action, 'method': action,
             'created_at': now_iso(), 'platform': platform_tag(), 'src': src, 'dest': dest,
             'data': data, 'backup': backup or src + BACKUP_SUFFIX + '-' + op_id,
             'staging': dest + '.wb-partial-' + op_id if action == 'migrate' else src + '.wb-restore-' + op_id,
@@ -1645,6 +2012,7 @@ def cmd_recover(args):
 
 @locked
 def cmd_cleanup_backup(args):
+    global _ACTIVE
     plan = load_plan(args.plan)
     validate_plan(plan, args)
     ensure_no_pending(plan['src'])
@@ -1660,13 +2028,18 @@ def cmd_cleanup_backup(args):
         raise SafeAbort('尚未确认恢复完成，拒绝清理旧位置。')
     if restored and plan.get('restored_identity') and identity(src) != plan['restored_identity']:
         raise SafeAbort('已恢复目录身份发生变化，拒绝清理旧位置。')
+    _ACTIVE = plan
     if os.path.isdir(obsolete):
         if same_path(obsolete, src) or (not restored and same_path(obsolete, dest)):
             raise SafeAbort('待清理位置仍是当前数据，拒绝删除。')
         if not plan.get('source_digest') or manifest_digest(manifest(obsolete, hashes=True, label='确认旧副本身份')) != plan['source_digest']:
             raise SafeAbort('旧副本身份无法确认或内容已变化，拒绝自动清理。请人工检查。')
-        with Progress('[5/6] 仅清理旧副本'):
-            print(trash_path(obsolete, hard=args.hard_delete), flush=True)
+        try:
+            with Progress('[5/6] 仅清理旧副本'):
+                print(trash_path(obsolete, hard=args.hard_delete), flush=True)
+        except Exception as ex:
+            warn('数据操作已完成，仅旧副本清理未完成，保留在 %s: %s' % (obsolete, ex))
+            return
     else:
         print('旧副本已不存在。', flush=True)
     plan.update(backup_removed=_CLEANUP_ENGINE != 'keep', obsolete_removed=_CLEANUP_ENGINE != 'keep')
@@ -1822,6 +2195,8 @@ class _LogStream:
 
     def progress(self, text, final=False, force=False, lines=None, failed=False):
         with self.mutex:
+            if _PROMPTING.is_set():
+                return
             self.log.write(text + '\n'); self.log.flush()
             tty = self.console.isatty() and _DISPLAY != 'plain'
             if tty and self.normal_line_open:
@@ -1884,8 +2259,8 @@ def report_result(rc, log_path, failure=None):
         print('数据操作已完成；待处理提醒如下：', flush=True)
         for message in _WARNINGS:
             print('  - ' + message, flush=True)
-        if _ACTIVE and _ACTIVE.get('action') in ('restore', 'rollback'):
-            print('无需重跑恢复；仅清理旧位置可用新版 cleanup-backup --plan "%s" --yes。' % _ACTIVE['plan_path'], flush=True)
+        if _ACTIVE:
+            print('无需重跑数据操作；仅清理旧副本可用 cleanup-backup --plan "%s" --yes；权限修改仍需现场确认。' % _ACTIVE['plan_path'], flush=True)
     print('结束: %s\n日志: %s' % (now_iso(), log_path), flush=True)
     return rc
 
@@ -1930,7 +2305,7 @@ def cmd_run_job(args):
             job = json.load(f)
         command = job.get('command', 'migrate')
         common = dict(no_relaunch=False, force_any_dir=False, workers=worker_count(job.get('workers', DEFAULT_IO_WORKERS)),
-                      copy_engine=job.get('copy_engine', 'auto'), cleanup=job.get('cleanup', 'auto'), display=job.get('display', 'auto'), copy_tool=job.get('copy_tool'))
+                      copy_engine=job.get('copy_engine', 'auto'), cleanup=job.get('cleanup', 'auto'), display=job.get('display', 'auto'), copy_tool=job.get('copy_tool'), permission_repair=job.get('permission_repair', 'ask'))
         print('执行方案: 复制=%s / 清理=%s / 并发=%d' % (common['copy_engine'], common['cleanup'], common['workers']), flush=True)
         if command == 'migrate':
             if not job.get('dest_base'):
@@ -1938,11 +2313,11 @@ def cmd_run_job(args):
             print('迁移目标: ' + os.path.join(job['dest_base'], destination_name(job.get('name'))), flush=True)
             cmd_migrate(argparse.Namespace(dest_base=job['dest_base'], name=job.get('name'), args_file=None,
                        src=None, skip_app_handling=False, keep_backup=job.get('keep_backup', False), **common))
-        elif command in ('restore', 'rollback', 'recover'):
+        elif command in ('restore', 'rollback', 'recover', 'cleanup-backup'):
             if not job.get('plan'):
                 raise ValueError('Job is missing plan')
-            method = {'restore': cmd_restore, 'rollback': cmd_rollback, 'recover': cmd_recover}[command]
-            method(argparse.Namespace(plan=job['plan'], keep_backup=job.get('keep_backup', False), hard_delete=False, **common))
+            method = {'restore': cmd_restore, 'rollback': cmd_rollback, 'recover': cmd_recover, 'cleanup-backup': cmd_cleanup_backup}[command]
+            method(argparse.Namespace(plan=job['plan'], keep_backup=job.get('keep_backup', False), hard_delete=False, yes=command == 'cleanup-backup', **common))
         else:
             raise ValueError('Unsupported runner command: ' + command)
     raise SystemExit(execute_logged(action, getattr(args, 'log_dir', None)))
@@ -2050,7 +2425,7 @@ def cmd_make_runner(args):
         job_name = 'runner-%s-args.json' % command
     payload['keep_backup'] = getattr(args, 'keep_backup', False)
     payload['python_executable'] = python_executable
-    payload.update(copy_engine=_COPY_ENGINE, copy_tool=resolve_copy_engine(_COPY_ENGINE)[1], cleanup=_CLEANUP_ENGINE, display=_DISPLAY, capability_report=capability_report(), copy_probe=probe_result)
+    payload.update(copy_engine=_COPY_ENGINE, copy_tool=resolve_copy_engine(_COPY_ENGINE)[1], cleanup=_CLEANUP_ENGINE, display=_DISPLAY, permission_repair=_PERMISSION_REPAIR, capability_report=capability_report(), copy_probe=probe_result)
     payload['workers'] = worker_count(getattr(args, 'workers', DEFAULT_IO_WORKERS))
     suffix = '.bat' if os.name == 'nt' else ('.command' if sys.platform == 'darwin' else '.sh')
     out = os.path.abspath(os.path.expanduser(args.out or os.path.join(PLAN_DIR, 'run_' + command + suffix)))
@@ -2077,6 +2452,7 @@ def add_strategy_arguments(parser):
     parser.add_argument('--copy-tool', help='原生复制工具的绝对路径；生成时验证，执行时绑定')
     parser.add_argument('--cleanup', choices=['auto', 'keep', 'shell', 'trash', 'finder', 'gio', 'trash-put'], default='auto')
     parser.add_argument('--display', choices=['auto', 'compact', 'plain'], default='auto')
+    parser.add_argument('--permission-repair', choices=['ask', 'off'], default='ask', help='Windows 旧副本删除拒绝：现场确认修复或仅保留；--yes 不授权权限修改')
 
 
 def main():
@@ -2101,7 +2477,7 @@ def main():
     add_strategy_arguments(mg)
     mg.set_defaults(func=cmd_migrate)
     runner = sub.add_parser('make-runner')
-    runner.add_argument('--command', choices=['migrate', 'restore', 'rollback', 'recover'], default='migrate')
+    runner.add_argument('--command', choices=['migrate', 'restore', 'rollback', 'recover', 'cleanup-backup'], default='migrate')
     runner.add_argument('--dest-base')
     runner.add_argument('--name')
     runner.add_argument('--plan', default='latest')
