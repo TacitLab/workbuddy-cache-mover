@@ -562,8 +562,8 @@ def recycle_with_permissions(path):
             report = dict(root=path, account=api.account, sid=api.sid.hex(), elevated=api.elevated,
                           checked=checked, candidates=candidates, changes=changes, created_at=now_iso(),
                           status='awaiting_authorization', failure=str(failure))
-            report_path = os.path.join(PLAN_DIR, 'cleanup-permissions-%s-%s.json' %
-                                       (_ACTIVE['id'], uuid.uuid4().hex))
+            report['plan_path'] = _ACTIVE['plan_path']
+            report_path = os.path.join(PLAN_DIR, 'cleanup-permissions-%s.json' % uuid.uuid4().hex)
             report['events_path'] = report_path[:-5] + '-events.jsonl'
             atomic_json(report_path, report)
             _ACTIVE.setdefault('permission_reports', []).append(report_path)

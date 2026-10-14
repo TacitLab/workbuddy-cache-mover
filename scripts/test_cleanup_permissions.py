@@ -81,9 +81,11 @@ class PermissionTests(unittest.TestCase):
         self.assertEqual(m.without_delete_denies(acl(ace(kind=6)), SID), acl(ace(kind=6)))
         with self.assertRaises(OSError): m.without_delete_denies(b'bad', SID)
     def test_cancel_never_changes_acl_or_retries(self):
+        self.plan['id'] = '../untrusted-plan-label'  # 记录标签不得控制报告文件路径。
         with mock.patch.object(m, 'windows_recycle', side_effect=self.failure) as recycle, mock.patch('builtins.input', return_value=''):
             with self.assertRaises(OSError): m.recycle_with_permissions(self.backup)
         self.assertFalse(self.api.repaired); self.assertEqual(recycle.call_count, 1)
+        self.assertEqual(os.path.dirname(self.plan['permission_reports'][0]), self.plan_dir)
         with open(self.plan['permission_reports'][0], encoding='utf-8') as f:
             self.assertEqual(json.load(f)['status'], 'kept_without_authorization')
     def test_confirm_records_acl_before_writing_and_retries_once(self):
