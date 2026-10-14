@@ -4,17 +4,18 @@
 import argparse
 import codecs
 import contextlib
-import csv
 import datetime
 import functools
 import glob
 import hashlib
 import json
+import ntpath
 import os
 import platform
 import re
 import shutil
 import signal
+import shlex
 import stat as statmod
 import subprocess
 import sys
@@ -22,15 +23,17 @@ import tempfile
 import threading
 import time
 import traceback
+import unicodedata
 import uuid
 
 DEFAULT_SRC = os.path.join(os.path.expanduser("~"), ".workbuddy")
 PLAN_DIR = os.path.join(os.path.expanduser("~"), ".wb-cache-move")
 BACKUP_SUFFIX = ".wb-migration-backup"
-NAME_PAT = re.compile(r"workbuddy", re.IGNORECASE)
 WIN_SYMLINK_HINT = "目标需支持目录链接；Windows 本地卷使用 junction，UNC 需 symlink 权限。"
 _ACTIVE = None
 _WARNINGS = []
+NATIVE_WINDOWS = sys.platform == 'win32'
+FORCE_SIGNAL = getattr(signal, 'SIGKILL', 9)
 STAGES = {'prepared': '准备', 'copying': '复制数据', 'verifying': '内容校验',
           'verified': '校验完成', 'publishing': '发布已校验副本', 'published': '副本就绪',
           'switching': '切换原路径', 'committed': '数据切换完成', 'cleanup': '清理旧副本',
@@ -159,71 +162,87 @@ def mac_app_bundles(procs):
     return bundles
 
 def windows_main_exes():
-    """记录当前运行的 WorkBuddy 主程序 exe 路径（Windows，用于迁移后重开）。"""
-    try:
-        r = subprocess.run(
-            ["powershell", "-NoProfile", "-Command",
-             "Get-Process | Where-Object { $_.Path -match 'workbuddy' } | "
-             "Select-Object -ExpandProperty Path -Unique"],
-            capture_output=True, text=True, errors="replace", timeout=20)
-        return [line.strip() for line in (r.stdout or "").splitlines()
-                if line.strip() and os.path.basename(line.strip()).lower() == "workbuddy.exe"]
-    except Exception:
-        return []
+    return sorted({record['path'] for record in _PROCESS_RECORDS.values()
+                   if ntpath.basename(record['path']).lower() == 'workbuddy.exe'})
+
 
 def wait_apps_gone(timeout):
-    for _ in range(timeout):
-        time.sleep(1)
-        state, _ = detect_app_running()
-        if state == "not-running":
+    deadline = time.monotonic() + timeout
+    while True:
+        state, detail = detect_app_running()
+        if state == 'not-running':
             return True
-    return False
+        if state == 'unknown':
+            raise SafeAbort('退出后无法核对进程，停止搬迁: ' + str(detail))
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(1, remaining))
+
 
 def kill_running(sig):
     state, procs = detect_app_running()
-    if state != "running":
+    if state == 'unknown':
+        raise SafeAbort('无法核对待退出进程，停止搬迁。')
+    if any(int(pid) == os.getpid() for pid, _ in procs):
+        raise SafeAbort('启动器属于 WorkBuddy 进程树，请在 WorkBuddy 之外的系统终端执行。')
+    if os.name == 'nt':
+        # 按已核对身份的 PID 操作；/T 包括子进程，不能按同名映像全局结束。
+        pending = {str(pid) for pid, _ in procs}
+        roots = [pid for pid in pending if str(_PROCESS_RECORDS.get(pid, {}).get('ppid')) not in pending]
+        for pid in roots:
+            # 每次重新核对，避免 PID 在前一次查询之后已被其他应用复用。
+            previous = _PROCESS_RECORDS.get(pid)
+            fresh_state, fresh = detect_app_running()
+            if fresh_state == 'unknown':
+                raise SafeAbort('结束进程前身份核对失败，停止搬迁。')
+            if not previous or _PROCESS_RECORDS.get(pid) != previous or pid not in {str(p) for p, _ in fresh}:
+                continue
+            command = ['taskkill', '/PID', pid, '/T']
+            if sig == FORCE_SIGNAL:
+                command.append('/F')
+            subprocess.run(command, capture_output=True, timeout=10)
         return
     for pid, _comm in procs:
+        previous = _PROCESS_RECORDS.get(str(pid))
+        fresh_state, fresh = detect_app_running()
+        if fresh_state == 'unknown':
+            raise SafeAbort('结束进程前身份核对失败，停止搬迁。')
+        if not previous or _PROCESS_RECORDS.get(str(pid)) != previous or str(pid) not in {str(p) for p, _ in fresh}:
+            continue
         try:
             os.kill(int(pid), sig)
-        except (ProcessLookupError, PermissionError, ValueError, OSError):
+        except ProcessLookupError:
             pass
+        except (PermissionError, ValueError, OSError) as ex:
+            warn('无法结束进程 %s: %s' % (pid, ex))
+
 
 def graceful_quit_all(procs):
-    """自动退出所有 WorkBuddy/CodeBuddy 进程并等待退出；超时强杀兜底。
-    返回迁移完成后需要重新打开的应用路径列表（仅 WorkBuddy 主程序）。"""
-    if sys.platform == "darwin":
-        bundles = mac_app_bundles(procs)
-        for b in bundles:
-            subprocess.run(
-                ["osascript", "-e", 'tell application "%s" to quit' % b],
-                capture_output=True, text=True, errors="replace", timeout=20)
-        if not wait_apps_gone(20):
-            print("      优雅退出超时，发送 SIGTERM ...")
-            kill_running(signal.SIGTERM)
-            if not wait_apps_gone(10):
-                print("      仍未退出，强制结束 ...")
-                kill_running(signal.SIGKILL)
-                if not wait_apps_gone(5):
-                    raise RuntimeError("无法结束 WorkBuddy 进程，请手动退出后重试")
-        return [b for b in bundles if "workbuddy" in os.path.basename(b).lower()]
-    if os.name == "nt":
-        names = sorted({comm for _pid, comm in procs})
+    """退出主程序、托盘与已核对归属的子进程，确认全部退出后返回。"""
+    if any(int(pid) == os.getpid() for pid, _ in procs):
+        raise SafeAbort('启动器属于 WorkBuddy 进程树，请在 WorkBuddy 之外的系统终端执行。')
+    relaunch = []
+    if sys.platform == 'darwin':
+        relaunch = mac_app_bundles(procs)
+        for bundle in relaunch:
+            script = 'on run argv\n tell application (item 1 of argv) to quit\nend run'
+            subprocess.run(['osascript', '-e', script, bundle], capture_output=True,
+                           text=True, errors='replace', timeout=10)
+    elif os.name == 'nt':
         relaunch = windows_main_exes()
-        for n in names:
-            subprocess.run(["taskkill", "/IM", n], capture_output=True, timeout=20)
-        if not wait_apps_gone(20):
-            for n in names:
-                subprocess.run(["taskkill", "/IM", n, "/F"], capture_output=True, timeout=20)
-            if not wait_apps_gone(10):
-                raise RuntimeError("无法结束 WorkBuddy 进程，请手动退出后重试")
-        return relaunch
-    kill_running(signal.SIGTERM)
-    if not wait_apps_gone(15):
-        kill_running(signal.SIGKILL)
-        if not wait_apps_gone(5):
-            raise RuntimeError("无法结束 WorkBuddy 进程，请手动退出后重试")
-    return []
+    if sys.platform != 'darwin':
+        kill_running(signal.SIGTERM)
+    if not wait_apps_gone(8):
+        print('      托盘或后台进程仍在运行，结束已核对的 WorkBuddy 进程树 ...', flush=True)
+        if sys.platform == 'darwin':
+            kill_running(signal.SIGTERM)
+        if not wait_apps_gone(3):
+            kill_running(FORCE_SIGNAL)
+            if not wait_apps_gone(5):
+                raise SafeAbort('WorkBuddy 托盘/后台仍未退出，请手动退出后重试；尚未开始复制。')
+    print('      已确认 WorkBuddy 主程序、托盘与子进程全部退出。', flush=True)
+    return relaunch
 
 class SafeAbort(RuntimeError):
     code = 1
@@ -263,7 +282,35 @@ def require_supported():
 
 
 def canonical(path):
-    return os.path.normcase(os.path.realpath(os.path.abspath(os.path.expanduser(path))))
+    return os.path.normcase(display_path(os.path.realpath(native_path(os.path.abspath(os.path.expanduser(path))))))
+
+
+def windows_path(path):
+    """Win32 Unicode 文件接口路径；不依赖注册表的 LongPathsEnabled 设置。"""
+    path = os.fsdecode(path)
+    if path.startswith('\\\\?\\'):
+        tail = path[4:]
+        if not (tail.startswith('UNC\\') or (len(tail) >= 3 and tail[0].isalpha() and tail[1:3] == ':\\')):
+            raise SafeAbort('不支持设备命名空间作为迁移目录。')
+        return path
+    if path.startswith('\\\\.\\'):
+        raise SafeAbort('不支持设备路径作为迁移目录。')
+    path = ntpath.abspath(path)
+    if path.startswith('\\\\'):
+        return '\\\\?\\UNC\\' + path[2:]
+    return '\\\\?\\' + path
+
+
+def native_path(path):
+    return windows_path(path) if NATIVE_WINDOWS else os.fspath(path)
+
+
+def display_path(path):
+    if path.startswith('\\\\?\\UNC\\'):
+        return '\\\\' + path[8:]
+    if path.startswith('\\\\?\\'):
+        return path[4:]
+    return path
 
 
 def same_path(a, b):
@@ -369,20 +416,36 @@ class Progress:
             self.files += count
             self.bytes += size
 
-    def report(self):
+    def report(self, final=False, force=False):
         with self.mutex:
             count, size = self.files, self.bytes
         elapsed = time.monotonic() - self.start
-        text = '%s | 已用时 %.0fs | %d 项' % (self.label, elapsed, count)
-        if self.total_files is not None:
-            text += '/%d' % self.total_files
+        text = self.label
         if self.total_bytes is not None:
-            text += ' | %s/%s' % (fmt_bytes(size), fmt_bytes(self.total_bytes))
-            if self.total_bytes:
-                text += ' (%.1f%%)' % min(100, size * 100 / self.total_bytes)
-            if elapsed > 1 and size:
-                text += ' | %s/s' % fmt_bytes(size / elapsed)
-        print(text, flush=True)
+            fraction = min(1, size / self.total_bytes) if self.total_bytes else (min(1, count / self.total_files) if self.total_files else 1)
+            filled = int(fraction * 12)
+            text += ' | [%s%s] %.1f%% | %s/%s' % ('#' * filled, '-' * (12 - filled), fraction * 100, fmt_bytes(size), fmt_bytes(self.total_bytes))
+        elif size:
+            text += ' | 已读取 ' + fmt_bytes(size)
+        if self.total_files is not None:
+            text += ' | %d/%d 项' % (count, self.total_files)
+        elif count:
+            text += ' | %d 项' % count
+        text += ' | 已用时 %.0fs' % elapsed
+        if self.total_bytes is not None and elapsed > 1 and size:
+            text += ' | %s/s' % fmt_bytes(size / elapsed)
+        writer = getattr(sys.stdout, 'progress', None)
+        if writer:
+            writer(text, final=final, force=force)
+        elif sys.stdout.isatty():
+            line = fit_line(text)
+            width = cell_width(line)
+            previous = getattr(self, 'line_width', 0)
+            sys.stdout.write('\r' + line + ' ' * max(0, previous - width) + ('\n' if final else ''))
+            sys.stdout.flush()
+            self.line_width = 0 if final else width
+        elif final or force:
+            print(text, flush=True)
 
     def worker(self):
         while not self.stop.wait(self.interval):
@@ -390,7 +453,7 @@ class Progress:
 
     def __enter__(self):
         self.start = time.monotonic()
-        print(self.label + ' ...', flush=True)
+        self.report(force=True)
         self.thread = threading.Thread(target=self.worker, daemon=True)
         self.thread.start()
         return self
@@ -398,7 +461,7 @@ class Progress:
     def __exit__(self, *args):
         self.stop.set()
         self.thread.join()
-        self.report()
+        self.report(final=True)
 
 
 def signature(st):
@@ -412,6 +475,7 @@ def identity(path):
 
 def manifest(path, hashes=False, label='扫描目录'):
     """不跟随目录链接；目录、链接、内容均纳入校验，读取失败一律报错。"""
+    path = native_path(path)
     if not os.path.isdir(path):
         raise SafeAbort('数据目录不可访问: ' + path)
     root_stat = os.stat(path)
@@ -427,7 +491,7 @@ def manifest(path, hashes=False, label='扫描目录'):
                     record = {'kind': 'link', 'target': os.readlink(entry.path),
                               'directory': bool(getattr(st, 'st_file_attributes', 0) & 0x10) if os.name == 'nt' else False}
                 elif is_reparse_dir(entry.path):
-                    record = {'kind': 'junction', 'target': os.path.realpath(entry.path)}
+                    record = {'kind': 'junction', 'target': display_path(os.path.realpath(entry.path))}
                 elif statmod.S_ISDIR(st.st_mode):
                     record = {'kind': 'dir', 'mode': statmod.S_IMODE(st.st_mode)}
                     visit(entry.path)
@@ -475,6 +539,7 @@ def tree_stats(path):
 
 def run_copy(src, dest):
     """通用流式复制，四个平台采用相同计数与校验语义，无外部复制工具依赖。"""
+    src, dest = native_path(src), native_path(dest)
     records = manifest(src, label='[2/6] 扫描待复制数据')
     total = sum(r.get('size', 0) for r in records.values())
     os.makedirs(dest, mode=0o700, exist_ok=True)
@@ -511,7 +576,8 @@ def run_copy(src, dest):
             else:
                 if os.path.islink(d) or is_reparse_dir(d):
                     raise SafeAbort('拒绝写入临时副本内的链接: ' + d)
-                temporary = d + '.wb-file-' + uuid.uuid4().hex
+                # 固定短文件名，避免长原文件名再附加后缀超过单组件限制。
+                temporary = os.path.join(os.path.dirname(d), '.wb-file-' + uuid.uuid4().hex + '.tmp')
                 try:
                     with open(s, 'rb') as source, open(temporary, 'xb') as target:
                         while True:
@@ -526,6 +592,9 @@ def run_copy(src, dest):
                         raise SafeAbort('复制期间源文件发生变化: ' + s)
                     shutil.copystat(s, temporary, follow_symlinks=False)
                     os.replace(temporary, d)
+                except OSError as ex:
+                    raise SafeAbort('复制文件失败: %s\n源文件: %s\n目标文件: %s' %
+                                    (ex, display_path(s), display_path(d))) from ex
                 finally:
                     if os.path.exists(temporary):
                         os.unlink(temporary)
@@ -629,33 +698,103 @@ def validate_plan(plan, args):
             raise SafeAbort('记录中数据路径存在嵌套关系。')
 
 
+_PROCESS_IDENTITIES = {}
+_PROCESS_RECORDS = {}
+
+
+def process_snapshot():
+    """只读取进程名、可执行路径与启动时间；不采集可能含隐私的命令行。"""
+    records = {}
+    if os.name == 'nt':
+        ps = os.path.join(os.environ.get('SystemRoot', r'C:\Windows'),
+                          'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+        script = ("$ErrorActionPreference='Stop'; "
+                  "[Console]::OutputEncoding=New-Object System.Text.UTF8Encoding; "
+                  "@(Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,Name,ExecutablePath,"
+                  "@{Name='Started';Expression={if ($_.CreationDate) {$_.CreationDate.ToUniversalTime().Ticks.ToString()}}}) "
+                  "| ConvertTo-Json -Compress")
+        result = subprocess.run([ps, '-NoProfile', '-NonInteractive', '-Command', script],
+                                capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=10)
+        if result.returncode != 0:
+            raise SafeAbort('Windows 进程查询失败: ' + (result.stderr or str(result.returncode))[:200])
+        rows = json.loads(result.stdout.lstrip('\ufeff'))
+        if isinstance(rows, dict):
+            rows = [rows]
+        for row in rows:
+            pid = str(int(row['ProcessId']))
+            records[pid] = dict(pid=pid, ppid=str(int(row['ParentProcessId'])),
+                                name=row['Name'], path=row.get('ExecutablePath') or '',
+                                started=row.get('Started') or '')
+    else:
+        result = subprocess.run(['ps', '-axo', 'pid=,ppid=,lstart=,comm='],
+                                capture_output=True, text=True, errors='replace', timeout=10,
+                                env=dict(os.environ, LC_ALL='C'))
+        if result.returncode != 0:
+            raise SafeAbort('POSIX 进程查询失败: ' + (result.stderr or str(result.returncode))[:200])
+        for line in result.stdout.splitlines():
+            parts = line.strip().split(None, 7)
+            if len(parts) != 8 or not parts[0].isdigit() or not parts[1].isdigit():
+                raise SafeAbort('进程查询返回无法识别的数据。')
+            pid, ppid = parts[:2]
+            comm = parts[7]
+            path = comm
+            if sys.platform.startswith('linux'):
+                try:
+                    path = os.readlink('/proc/%s/exe' % pid)
+                except OSError:
+                    pass
+            records[pid] = dict(pid=pid, ppid=ppid, name=os.path.basename(comm),
+                                path=path, started=' '.join(parts[2:7]))
+    if not records:
+        raise SafeAbort('进程列表为空，无法确认应用已退出。')
+    return records
+
+
+def process_identity(record):
+    return record['name'], record['path'], record['started']
+
+
+def owns_app_process(record):
+    name = record['name'].lower()
+    if name in ('workbuddy', 'workbuddy.exe') or name.startswith('workbuddy helper'):
+        return True
+    path = record['path'].replace('\\', '/').lower()
+    # 独立运行的 CodeBuddy 不属于本工具；仅确认 WorkBuddy 安装目录中的引擎。
+    installed = any(part in ('workbuddy', 'workbuddy.app', '.workbuddy') for part in path.split('/')[:-1])
+    return installed and name in ('codebuddy', 'codebuddy.exe', 'electron', 'electron.exe')
+
+
 def detect_app_running():
-    hits = []
+    global _PROCESS_RECORDS, _PROCESS_IDENTITIES
     try:
-        if os.name == 'nt':
-            r = subprocess.run(['tasklist', '/FO', 'CSV', '/NH'], capture_output=True, text=True, errors='replace', timeout=20)
-            if r.returncode != 0 or not r.stdout.strip():
-                return 'unknown', 'tasklist 失败: ' + (r.stderr or r.stdout or str(r.returncode))[:200]
-            for row in csv.reader(r.stdout.splitlines()):
-                if len(row) < 2 or not row[1].isdigit():
-                    return 'unknown', 'tasklist 返回无法识别的数据。'
-                if NAME_PAT.search(row[0]):
-                    hits.append((row[1], row[0]))
-        else:
-            r = subprocess.run(['ps', '-axo', 'pid=,comm='], capture_output=True, text=True, errors='replace', timeout=20)
-            if r.returncode != 0 or not r.stdout.strip():
-                return 'unknown', 'ps 失败: ' + (r.stderr or str(r.returncode))[:200]
-            for line in r.stdout.splitlines():
-                parts = line.strip().split(None, 1)
-                if len(parts) != 2 or not parts[0].isdigit():
-                    return 'unknown', 'ps 返回无法识别的数据。'
-                pid, comm = parts
-                basename = os.path.basename(comm).lower()
-                if NAME_PAT.search(basename) and not basename.startswith(('python', 'sh', 'bash', 'zsh', 'node', 'rg')):
-                    hits.append((pid, comm))
-    except (OSError, subprocess.SubprocessError) as ex:
+        records = process_snapshot()
+        owned = {pid for pid, record in records.items() if owns_app_process(record) or
+                 (record['started'] and _PROCESS_IDENTITIES.get(pid) == process_identity(record))}
+        # 保留退出主程序后变为孤儿的助手身份，直到其退出或 PID 被复用。
+        changed = True
+        while changed:
+            changed = False
+            for pid, record in records.items():
+                if pid not in owned and record['ppid'] in owned:
+                    parent = records[record['ppid']]
+                    # 不能把新进程复用的父 PID 当作历史父子关系。
+                    if os.name == 'nt' and record['started'] and parent['started']:
+                        if int(record['started']) < int(parent['started']):
+                            continue
+                    elif record['started'] and parent['started']:
+                        fmt = '%a %b %d %H:%M:%S %Y'
+                        if time.strptime(record['started'], fmt) < time.strptime(parent['started'], fmt):
+                            continue
+                    owned.add(pid)
+                    changed = True
+        if any(not records[pid]['started'] for pid in owned):
+            raise SafeAbort('无法核对 WorkBuddy 进程启动身份。')
+        _PROCESS_RECORDS = {pid: records[pid] for pid in owned}
+        _PROCESS_IDENTITIES = {pid: process_identity(record) for pid, record in _PROCESS_RECORDS.items()}
+        hits = [(pid, record['path'] or record['name']) for pid, record in _PROCESS_RECORDS.items()]
+        return ('running' if hits else 'not-running'), hits
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError, SafeAbort) as ex:
         return 'unknown', str(ex)
-    return ('running' if hits else 'not-running'), hits
 
 
 def assert_offline(manage=True):
@@ -1144,17 +1283,63 @@ def default_log_dir():
     return os.path.join(os.environ.get('XDG_STATE_HOME', os.path.join(os.path.expanduser('~'), '.local', 'state')), 'WorkBuddyCacheMover', 'logs')
 
 
+def cell_width(text):
+    return sum(0 if unicodedata.combining(c) else (2 if unicodedata.east_asian_width(c) in ('W', 'F') else 1) for c in text)
+
+
+def fit_line(text):
+    limit = max(10, shutil.get_terminal_size((100, 24)).columns - 2)
+    if cell_width(text) <= limit:
+        return text
+    out, width = [], 0
+    for char in text:
+        amount = cell_width(char)
+        if width + amount > limit - 3:
+            break
+        out.append(char)
+        width += amount
+    return ''.join(out) + '...'
+
+
 class _LogStream:
     def __init__(self, console, log, mutex):
         self.console, self.log, self.mutex = console, log, mutex
+        self.progress_width = 0
+        self.progress_visible = False
+        self.normal_line_open = False
 
     def write(self, text):
         with self.mutex:
             self.log.write(text)
             self.log.flush()
+            if self.progress_visible:
+                self.console.write('\r' + ' ' * self.progress_width + '\r')
+                self.progress_visible = False
+                self.progress_width = 0
             result = self.console.write(text)
             self.console.flush()
+            if text:
+                self.normal_line_open = not text.endswith('\n')
             return result
+
+    def progress(self, text, final=False, force=False):
+        with self.mutex:
+            # 日志保留每次采样，终端只更新当前行；控制字符不进入日志。
+            self.log.write(text + '\n')
+            self.log.flush()
+            if self.console.isatty():
+                if self.normal_line_open and not final:
+                    return
+                line = fit_line(text)
+                width = cell_width(line)
+                self.console.write('\r' + line + ' ' * max(0, self.progress_width - width))
+                if final:
+                    self.console.write('\n')
+                self.progress_width = 0 if final else width
+                self.progress_visible = not final
+            elif final or force:
+                self.console.write(text + '\n')
+            self.console.flush()
 
     def flush(self):
         with self.mutex:
@@ -1202,6 +1387,8 @@ def execute_logged(action, log_dir=None):
             action()
         except SafeAbort as ex:
             rc, failure = ex.code, ex
+            if ex.__cause__ is not None:
+                traceback.print_exc(file=log)
         except SystemExit as ex:
             rc = ex.code if isinstance(ex.code, int) else (0 if ex.code is None else 1)
             failure = ex.code if not isinstance(ex.code, int) else None
@@ -1240,14 +1427,54 @@ def cmd_run_job(args):
     raise SystemExit(execute_logged(action, getattr(args, 'log_dir', None)))
 
 
-def windows_runner_content(job_name):
+def resolve_runner_python(explicit=None):
+    """选择并实际验证解释器；支持现有便携 Python，不交付已知不能启动的入口。"""
+    candidates = [(os.path.abspath(os.path.expanduser(explicit)), [])] if explicit else [(sys.executable, [])]
+    if not explicit:
+        for name in ('python3', 'python', 'py'):
+            path = shutil.which(name)
+            if path:
+                candidates.append((path, ['-3'] if name == 'py' else []))
+    probe = 'import json,sys; print(json.dumps({"version":list(sys.version_info[:3]),"executable":sys.executable,"prefix":sys.prefix}))'
+    errors = []
+    for path, flags in candidates:
+        try:
+            if not os.path.isfile(native_path(path)):
+                continue
+            if NATIVE_WINDOWS and '\\windowsapps\\' in path.lower():
+                continue
+            result = subprocess.run([path] + flags + ['-X', 'utf8', '-c', probe], capture_output=True,
+                                    text=True, encoding='utf-8', errors='replace', timeout=15)
+            if result.returncode:
+                raise ValueError(result.stderr.strip() or '解释器无法启动')
+            info = json.loads(result.stdout)
+            if tuple(info['version']) < (3, 8):
+                raise ValueError('需要 Python 3.8+')
+            if any(is_within(DEFAULT_SRC, info[key]) for key in ('executable', 'prefix')):
+                raise ValueError('解释器位于待迁移数据目录中')
+            selected = os.path.abspath(display_path(info['executable']))
+            if NATIVE_WINDOWS and any(char in selected for char in ('"', '\r', '\n')):
+                raise ValueError('解释器路径包含无效字符')
+            return selected
+        except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as ex:
+            errors.append('%s: %s' % (path, ex))
+    raise UnsupportedEnvironment('未找到数据目录之外的可用 Python。可用 --python 指定已有便携解释器。'
+                                 '未生成新的启动脚本。\n' + '\n'.join(errors[-3:]))
+
+
+def windows_runner_content(job_name, python_executable=None):
+    bootstrap = [
+        'set "PYEXE="', 'set "PYFLAG="',
+        'for /f "delims=" %%P in (\'where py.exe 2^>nul\') do if not defined PYEXE call :try_python "%%P" -3',
+        'for /f "delims=" %%P in (\'where python.exe 2^>nul\') do if not defined PYEXE call :try_python "%%P"',
+    ]
+    if python_executable:
+        bootstrap = ['set "PYEXE=' + python_executable.replace('%', '%%') + '"', 'set "PYFLAG="']
     return '\r\n'.join([
         '@echo off', 'setlocal DisableDelayedExpansion',
         'chcp 65001 >nul', 'title WorkBuddy cache mover',
         'echo Preparing. Do not reopen WorkBuddy during the operation.',
-        'set "PYEXE="', 'set "PYFLAG="',
-        'for /f "delims=" %%P in (\'where py.exe 2^>nul\') do if not defined PYEXE call :try_python "%%P" -3',
-        'for /f "delims=" %%P in (\'where python.exe 2^>nul\') do if not defined PYEXE call :try_python "%%P"',
+    ] + bootstrap + [
         'if defined PYEXE goto execute',
         'echo No working external Python 3.8+ found. Install system Python from python.org.',
         'set "RC=5"', 'goto finish', ':execute',
@@ -1263,13 +1490,19 @@ def windows_runner_content(job_name):
     ])
 
 
-def posix_runner_content(job_name):
-    return '\n'.join([
-        '#!/bin/sh', 'SCRIPT_DIR=$(CDPATH= cd -P "$(dirname "$0")" && pwd) || exit 1',
+def posix_runner_content(job_name, python_executable=None):
+    bootstrap = [
         'PY=""', 'rc=5',
         'for cand in "$(command -v python3)" "$(command -v python)" /opt/homebrew/bin/python3 /usr/local/bin/python3; do',
         '  if [ -x "$cand" ] && "$cand" -c "import sys; sys.exit(0 if sys.version_info >= (3,8) else 1)" >/dev/null 2>&1; then PY="$cand"; break; fi',
-        'done', 'if [ -n "$PY" ]; then',
+        'done',
+    ]
+    if python_executable:
+        bootstrap = ['PY=' + shlex.quote(python_executable), 'rc=5']
+    return '\n'.join([
+        '#!/bin/sh', 'SCRIPT_DIR=$(CDPATH= cd -P "$(dirname "$0")" && pwd) || exit 1',
+    ] + bootstrap + [
+        'if [ -n "$PY" ]; then',
         '  "$PY" -X utf8 -u "$SCRIPT_DIR/cache_mover.py" run-job --args-file "$SCRIPT_DIR/' + job_name + '"',
         '  rc=$?', 'else', '  echo "No working external Python 3.8+ found. Install system Python."', 'fi',
         'echo "Exit code: $rc (0=success, 2=completed with warnings, 3=recovery required, 4=busy, 5=environment unsupported)"',
@@ -1281,6 +1514,7 @@ def posix_runner_content(job_name):
 @locked
 def cmd_make_runner(args):
     command = args.command
+    python_executable = resolve_runner_python(getattr(args, 'python_executable', None))
     if command == 'migrate':
         if not args.dest_base:
             raise SafeAbort('需要 --dest-base。')
@@ -1293,6 +1527,7 @@ def cmd_make_runner(args):
         payload = {'command': command, 'plan': plan['plan_path']}
         job_name = 'runner-%s-args.json' % command
     payload['keep_backup'] = getattr(args, 'keep_backup', False)
+    payload['python_executable'] = python_executable
     suffix = '.bat' if os.name == 'nt' else ('.command' if sys.platform == 'darwin' else '.sh')
     out = os.path.abspath(os.path.expanduser(args.out or os.path.join(PLAN_DIR, 'run_' + command + suffix)))
     folder = os.path.dirname(out)
@@ -1301,12 +1536,13 @@ def cmd_make_runner(args):
     if not same_path(__file__, local):
         shutil.copy2(__file__, local)
     atomic_json(os.path.join(folder, job_name), payload)
-    content = windows_runner_content(job_name) if os.name == 'nt' else posix_runner_content(job_name)
-    with open(out, 'w', encoding='ascii' if os.name == 'nt' else 'utf-8', newline='') as f:
+    content = windows_runner_content(job_name, python_executable) if os.name == 'nt' else posix_runner_content(job_name, python_executable)
+    with open(out, 'w', encoding='utf-8', newline='') as f:
         f.write(content)
     if os.name != 'nt':
         os.chmod(out, 0o755)
     print('已生成: ' + out, flush=True)
+    print('唯一启动入口: %s\n已验证的解释器: %s' % (out, python_executable), flush=True)
     print('Windows/macOS 可双击；Linux 在终端执行 sh "脚本路径"。日志、阶段与退出码统一。', flush=True)
     print('更新 Skill 后必须重新生成启动脚本。独立系统 Python 必須位于数据目录之外。', flush=True)
 
@@ -1335,6 +1571,7 @@ def main():
     runner.add_argument('--name')
     runner.add_argument('--plan', default='latest')
     runner.add_argument('--out')
+    runner.add_argument('--python', dest='python_executable', help='指定数据目录之外的现有系统/便携 Python，生成唯一入口')
     runner.add_argument('--keep-backup', action='store_true')
     runner.set_defaults(func=cmd_make_runner)
     job = sub.add_parser('run-job')

@@ -36,7 +36,7 @@ class NativeRunnerTests(unittest.TestCase):
             folder, env = self.setup_job(root)
             path = os.path.join(folder, 'run.sh')
             with open(path, 'w', encoding='utf-8') as f:
-                f.write(m.posix_runner_content('broken.json'))
+                f.write(m.posix_runner_content('broken.json', sys.executable))
             result = subprocess.run(['sh', path], stdin=subprocess.DEVNULL,
                                     capture_output=True, text=True, encoding='utf-8', env=env, timeout=30)
             self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
@@ -54,8 +54,13 @@ class NativeRunnerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix='wb-native-') as root:
             folder, env = self.setup_job(root)
             path = os.path.join(folder, 'run.bat')
-            with open(path, 'w', encoding='ascii', newline='') as f:
-                f.write(m.windows_runner_content('broken.json'))
+            portable = os.path.join(root, '便携 Python 路径 ! & %')
+            m.make_link(os.path.dirname(sys.executable), portable)
+            selected = m.resolve_runner_python(os.path.join(portable, os.path.basename(sys.executable)))
+            with open(path, 'w', encoding='utf-8', newline='') as f:
+                f.write(m.windows_runner_content('broken.json', selected))
+            env['PATH'] = os.path.join(os.environ['SystemRoot'], 'System32')
+            self.assertNotIn('where py.exe', m.windows_runner_content('broken.json', selected))
             command = [os.environ['COMSPEC'], '/D', '/V:OFF', '/C', 'run.bat']
             process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                        stderr=subprocess.STDOUT, text=True, encoding='utf-8',
@@ -87,6 +92,7 @@ class NativeRunnerTests(unittest.TestCase):
                 reader.join(timeout=2)
                 process.stdin.close()
                 process.stdout.close()
+                m.remove_link(portable)
 
 
 if __name__ == '__main__':
