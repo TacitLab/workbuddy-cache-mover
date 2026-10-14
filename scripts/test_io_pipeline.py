@@ -94,6 +94,13 @@ class PipelineTests(unittest.TestCase):
         self.assertTrue(os.path.isfile(self.file))
     @unittest.skipUnless(os.name == 'nt', 'Native Windows Shell recycle fixture')
     def test_native_windows_recycle_preserves_the_fixture_in_recycle_bin(self):
+        deep = os.path.join(self.src, *(['directory-' + 'x' * 55] * 4))
+        os.makedirs(m.native_path(deep))
+        deep_file = os.path.join(deep, 'deep.txt')
+        with open(m.native_path(deep_file), 'wb') as f: f.write(b'deep payload')
+        external = os.path.join(self.tmp.name, 'external'); os.mkdir(external)
+        with open(os.path.join(external, 'keep.txt'), 'wb') as f: f.write(b'external payload')
+        m.make_link(external, os.path.join(self.src, 'junction'))
         recycled = m.windows_recycle(self.src)
         self.assertFalse(os.path.lexists(self.src))
         self.assertTrue(recycled, 'Shell did not supply recycled filesystem path')
@@ -101,6 +108,10 @@ class PipelineTests(unittest.TestCase):
         self.assertTrue(os.path.isdir(m.native_path(recycled)))
         try:
             with open(m.native_path(os.path.join(recycled, 'file.txt')), 'rb') as f: self.assertEqual(f.read(), b'payload')
+            copied_deep = os.path.join(recycled, os.path.relpath(deep_file, self.src))
+            with open(m.native_path(copied_deep), 'rb') as f: self.assertEqual(f.read(), b'deep payload')
+            with open(os.path.join(external, 'keep.txt'), 'rb') as f: self.assertEqual(f.read(), b'external payload')
+            m.remove_link(os.path.join(recycled, 'junction'))
         finally:
             # 仅清理本用例刚创建、已核对内容的回收站目录，不能清空用户回收站。
             shutil.rmtree(m.native_path(recycled))
