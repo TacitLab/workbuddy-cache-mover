@@ -37,6 +37,10 @@ _WARNINGS = []
 DEFAULT_IO_WORKERS = 4 if sys.platform == 'win32' else 1
 _IO_WORKERS = DEFAULT_IO_WORKERS
 _COPY_RECEIPT = None
+_COPY_ENGINE = 'auto'
+_COPY_EXE = None
+_CLEANUP_ENGINE = 'auto'
+_DISPLAY = 'auto'
 NATIVE_WINDOWS = sys.platform == 'win32'
 FORCE_SIGNAL = getattr(signal, 'SIGKILL', 9)
 STAGES = {'prepared': '准备', 'copying': '复制数据', 'verifying': '内容校验',
@@ -226,42 +230,61 @@ def windows_recycle(path):
         ole.CoUninitialize()
 
 
+def cleanup_choices():
+    choices = ['auto', 'keep']
+    if os.name == 'nt':
+        choices.append('shell')
+    elif sys.platform == 'darwin':
+        choices.extend(['trash', 'finder'])
+    else:
+        choices.extend(name for name in ('gio', 'trash-put') if shutil.which(name))
+    return choices
+
+
 def trash_path(path, hard=False):
-    """把目录移入系统废纸篓/回收站；hard=True 时永久删除。返回描述字符串。
-    这是"删除"操作的唯一推荐实现——个人文件永远先进废纸篓，可反悔。"""
+    """仅操作已核对的旧副本；回收不支持时保留，不降级为永久删除。"""
     if hard:
-        shutil.rmtree(path)
-        return "已永久删除: " + path
-    home = os.path.expanduser("~")
-    if sys.platform == "darwin":
-        trash_dir = os.path.join(home, ".Trash")
-        os.makedirs(trash_dir, exist_ok=True)
-        base = os.path.basename(os.path.abspath(path).rstrip(os.sep))
-        target = os.path.join(trash_dir, base)
-        i = 1
-        while os.path.lexists(target):
-            target = os.path.join(trash_dir, "%s %d" % (base, i))
-            i += 1
-        try:
-            os.rename(path, target)
-        except OSError:
-            # 外置卷交给 Finder 的原生废纸篓，不复制回系统盘。
-            script = 'on run argv\n tell application "Finder" to delete (POSIX file (item 1 of argv))\nend run'
-            r = subprocess.run(['osascript', '-e', script, path], capture_output=True, text=True, timeout=60)
-            if r.returncode != 0:
-                raise RuntimeError('移入目标卷废纸篓失败，原数据保留: ' + (r.stderr or '')[:200])
-            return '已移入目标卷废纸篓: ' + path
-        return "已移入废纸篓: " + target
-    if os.name == "nt":
+        shutil.rmtree(native_path(path))
+        return '已永久删除: ' + path
+    engine = _CLEANUP_ENGINE
+    if engine == 'keep':
+        return '已保留旧副本: ' + path
+    if engine not in cleanup_choices():
+        raise UnsupportedEnvironment('当前环境不能使用清理方式: ' + engine)
+    if os.name == 'nt':
         windows_recycle(path)
-        return "已移入回收站: " + path
-    for tool, extra in (("gio", ["trash"]), ("trash-put", [])):
-        exe = shutil.which(tool)
-        if exe:
-            r = subprocess.run([exe] + extra + [path], capture_output=True, text=True)
-            if r.returncode == 0:
-                return "已移入系统回收站: " + path
-    raise RuntimeError("当前环境无回收站工具。如确认要永久删除请加 --hard-delete")
+        return '已移入回收站: ' + path
+    if sys.platform == 'darwin':
+        if engine in ('auto', 'trash'):
+            trash_dir = os.path.join(os.path.expanduser('~'), '.Trash')
+            os.makedirs(trash_dir, exist_ok=True)
+            base = os.path.basename(os.path.abspath(path).rstrip(os.sep))
+            target = os.path.join(trash_dir, base)
+            count = 1
+            while os.path.lexists(target):
+                target = os.path.join(trash_dir, '%s %d' % (base, count)); count += 1
+            try:
+                os.rename(path, target)
+                return '已移入废纸篓: ' + target
+            except OSError:
+                if engine == 'trash':
+                    raise OSError('当前路径不能直接移入本机废纸篓；可选择 finder 或 keep。')
+        script = 'on run argv\n tell application "Finder" to delete (POSIX file (item 1 of argv))\nend run'
+        result = subprocess.run(['osascript', '-e', script, path], capture_output=True, text=True, timeout=120)
+        if result.returncode or os.path.lexists(native_path(path)):
+            raise OSError('Finder 回收未完成，旧副本保留: ' + (result.stderr or '')[:200])
+        return '已移入目标卷废纸篓: ' + path
+    candidates = ('gio', 'trash-put') if engine == 'auto' else (engine,)
+    for name in candidates:
+        executable = shutil.which(name)
+        if executable:
+            command = [executable] + (['trash'] if name == 'gio' else []) + [path]
+            result = subprocess.run(command, capture_output=True, text=True, timeout=120)
+            if result.returncode == 0 and not os.path.lexists(path):
+                return '已移入系统回收站: ' + path
+            raise OSError('回收未完成，旧副本保留: ' + (result.stderr or '')[:200])
+    raise UnsupportedEnvironment('当前环境无可用回收工具，可选择 keep 保留旧副本。')
+
 
 def mac_app_bundles(procs):
     """从进程列表提取 .app bundle 路径（去重，主程序在前）。"""
@@ -504,18 +527,34 @@ def operation_lock():
                     fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
 
+def validate_settings(args):
+    copy = getattr(args, 'copy_engine', 'auto')
+    cleanup = getattr(args, 'cleanup', 'auto')
+    display = getattr(args, 'display', 'auto')
+    if copy not in ('auto', 'python', 'robocopy', 'rsync'):
+        raise SafeAbort('复制方式无效: ' + str(copy))
+    if cleanup not in cleanup_choices():
+        raise UnsupportedEnvironment('当前平台不支持所选清理方式: ' + str(cleanup))
+    if display not in ('auto', 'plain', 'compact'):
+        raise SafeAbort('显示方式无效: ' + str(display))
+    tool = getattr(args, 'copy_tool', None)
+    if tool and copy in ('auto', 'python'):
+        raise SafeAbort('--copy-tool 只用于显式选择的原生复制工具。')
+    return worker_count(getattr(args, 'workers', DEFAULT_IO_WORKERS)), copy, cleanup, display, tool
+
+
 def locked(func):
     @functools.wraps(func)
     def wrapped(args):
         require_supported()
-        global _IO_WORKERS
-        previous = _IO_WORKERS
-        _IO_WORKERS = worker_count(getattr(args, 'workers', DEFAULT_IO_WORKERS))
+        global _IO_WORKERS, _COPY_ENGINE, _CLEANUP_ENGINE, _DISPLAY, _COPY_EXE
+        previous = _IO_WORKERS, _COPY_ENGINE, _CLEANUP_ENGINE, _DISPLAY, _COPY_EXE
+        _IO_WORKERS, _COPY_ENGINE, _CLEANUP_ENGINE, _DISPLAY, _COPY_EXE = validate_settings(args)
         try:
             with operation_lock():
                 return func(args)
         finally:
-            _IO_WORKERS = previous
+            _IO_WORKERS, _COPY_ENGINE, _CLEANUP_ENGINE, _DISPLAY, _COPY_EXE = previous
     return wrapped
 
 
@@ -533,34 +572,48 @@ class Progress:
             self.files += count
             self.bytes += size
 
-    def report(self, final=False, force=False):
+    def report(self, final=False, force=False, failed=False):
         with self.mutex:
             count, size = self.files, self.bytes
-        elapsed = time.monotonic() - self.start
-        text = self.label
+        elapsed = max(0, time.monotonic() - self.start)
+        if not hasattr(self, 'samples'):
+            self.samples = collections.deque(maxlen=5)
+        self.samples.append((elapsed, size))
+        speed = size / elapsed if elapsed > 0 else 0
+        if len(self.samples) > 1:
+            span = elapsed - self.samples[0][0]
+            if span > 0.5:
+                speed = max(0, (size - self.samples[0][1]) / span)
+        parts = [self.label, '已用时 ' + fmt_duration(elapsed)]
+        fraction = None
         if self.total_bytes is not None:
             fraction = min(1, size / self.total_bytes) if self.total_bytes else (min(1, count / self.total_files) if self.total_files else 1)
-            filled = int(fraction * 12)
-            text += ' | [%s%s] %.1f%% | %s/%s' % ('#' * filled, '-' * (12 - filled), fraction * 100, fmt_bytes(size), fmt_bytes(self.total_bytes))
+            parts.extend(['%.1f%%' % (fraction * 100), '%s / %s' % (fmt_bytes(size), fmt_bytes(self.total_bytes))])
         elif size:
-            text += ' | 已读取 ' + fmt_bytes(size)
+            parts.append('已读取 ' + fmt_bytes(size))
         if self.total_files is not None:
-            text += ' | %d/%d 项' % (count, self.total_files)
+            parts.append('%s / %s 项' % (format(count, ','), format(self.total_files, ',')))
         elif count:
-            text += ' | %d 项' % count
-        text += ' | 已用时 %.0fs' % elapsed
+            parts.append(format(count, ',') + ' 项')
         if self.total_bytes is not None and elapsed > 1 and size:
-            text += ' | %s/s' % fmt_bytes(size / elapsed)
+            parts.append(fmt_bytes(speed) + '/s' if speed else '等待磁盘')
+        eta = None
+        if not final and self.total_bytes and elapsed >= 4 and 0 < size < self.total_bytes and speed:
+            eta = (self.total_bytes - size) / speed
+            parts.append('预计剩余 ' + fmt_duration(eta))
+        if final:
+            parts.append('已停止' if failed else '阶段完成')
+        text = ' | '.join(parts)
+        lines = progress_panel(self.label, elapsed, count, size, self.total_files, self.total_bytes,
+                               fraction, speed, eta, final, failed)
         writer = getattr(sys.stdout, 'progress', None)
         if writer:
-            writer(text, final=final, force=force)
-        elif sys.stdout.isatty():
-            line = fit_line(text)
-            width = cell_width(line)
-            previous = getattr(self, 'line_width', 0)
+            writer(text, final=final, force=force, lines=lines, failed=failed)
+        elif sys.stdout.isatty() and _DISPLAY != 'plain':
+            line = compact_progress(self.label, elapsed, fraction, size, self.total_bytes, speed)
+            width = cell_width(line); previous = getattr(self, 'line_width', 0)
             sys.stdout.write('\r' + line + ' ' * max(0, previous - width) + ('\n' if final else ''))
-            sys.stdout.flush()
-            self.line_width = 0 if final else width
+            sys.stdout.flush(); self.line_width = 0 if final else width
         elif final or force:
             print(text, flush=True)
 
@@ -578,7 +631,7 @@ class Progress:
     def __exit__(self, *args):
         self.stop.set()
         self.thread.join()
-        self.report(final=True)
+        self.report(final=True, failed=bool(args and args[0]))
 
 
 def signature(st):
@@ -708,12 +761,159 @@ def tree_path(root, relative):
     return root if relative == '.' else os.path.join(root, relative)
 
 
+def resolve_copy_engine(engine):
+    # auto 保留已验证的跨平台方式；Agent 可根据本地试验显式选择原生工具。
+    if engine in ('auto', 'python'):
+        return 'python', None
+    if (engine == 'robocopy' and os.name != 'nt') or (engine == 'rsync' and os.name == 'nt'):
+        raise UnsupportedEnvironment('复制工具不适用于当前平台: ' + engine)
+    executable = _COPY_EXE or shutil.which(engine)
+    if not executable or not os.path.isfile(executable) or not os.access(executable, os.X_OK):
+        raise UnsupportedEnvironment('未找到复制工具: ' + engine + '；可选择 python。')
+    if is_within(DEFAULT_SRC, executable):
+        raise UnsupportedEnvironment('复制工具必须位于待迁移数据目录之外。')
+    return engine, os.path.abspath(executable)
+
+
+def copy_command(engine, executable, src, dest):
+    source, target = display_path(os.path.abspath(src)), display_path(os.path.abspath(dest))
+    if engine == 'robocopy':
+        return [executable, source, target, '/E', '/COPY:DAT', '/DCOPY:DAT', '/SL', '/SJ',
+                '/R:1', '/W:1', '/MT:%d' % _IO_WORKERS, '/NP', '/NFL', '/NDL', '/NJH', '/NJS']
+    if engine == 'rsync':
+        return [executable, '-a', '--', source.rstrip(os.sep) + os.sep, target.rstrip(os.sep) + os.sep]
+    raise SafeAbort('不支持的原生复制工具。')
+
+
+def tool_success(engine, code):
+    return 0 <= code < 8 if engine == 'robocopy' else code == 0
+
+
+def native_copy(src, dest, records, engine, executable):
+    if is_within(src, dest) or is_within(dest, src):
+        raise SafeAbort('原生复制拒绝源目标相同或嵌套。')
+    os.makedirs(dest, mode=0o700, exist_ok=True)
+    if link_target(dest) is not None:
+        raise SafeAbort('临时副本根目录不能是链接。')
+    previous = manifest(dest, label='检查原生复制临时目录')
+    for name, record in previous.items():
+        if record['kind'] in ('link', 'junction'):
+            raise SafeAbort('原生复制不复用含链接的旧临时副本；请选择 python。')
+        if name not in records or record['kind'] != records[name]['kind']:
+            raise SafeAbort('临时副本含多余或类型不同的条目；请选择 python 核对后重建。')
+    command = copy_command(engine, executable, src, dest)
+    print('复制方式: %s；原生命令只写入临时副本，完成后仍执行完整内容校验。' % engine, flush=True)
+    # 将工具输出落入有上限的诊断摘要，不逐文件刷屏或扫描目标来伪造进度。
+    with tempfile.TemporaryFile() as output:
+        kwargs = dict(stdout=output, stderr=subprocess.STDOUT)
+        if os.name != 'nt':
+            kwargs['start_new_session'] = True
+        process = subprocess.Popen(command, **kwargs)
+        try:
+            with Progress('[2/6] %s 复制中' % engine):
+                code = process.wait()
+                if not tool_success(engine, code):
+                    output.seek(0, os.SEEK_END); length = output.tell(); output.seek(max(0, length - 4096))
+                    detail = output.read().decode('utf-8', errors='replace')
+                    raise SafeAbort('%s 复制未完成（工具退出码 %d），原路径保留。\n%s' % (engine, code, detail))
+        except BaseException:
+            if process.poll() is None:
+                if os.name == 'nt':
+                    subprocess.run(['taskkill', '/PID', str(process.pid), '/T', '/F'], capture_output=True, timeout=15)
+                else:
+                    os.killpg(process.pid, signal.SIGTERM)
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    if os.name != 'nt':
+                        os.killpg(process.pid, FORCE_SIGNAL)
+                    process.wait(timeout=5)
+            raise
+    copied = manifest(dest, label='核对原生副本结构')
+    expected = {name: {k: v for k, v in record.items() if k not in ('signature', 'sha256')} for name, record in records.items()}
+    if content_manifest(copied) != expected:
+        raise SafeAbort('原生工具未保留完整目录、文件大小、链接或权限，拒绝切换。')
+    files = [(name, record) for name, record in copied.items() if record['kind'] == 'file']
+    with Progress('[2/6] 确认副本落盘', total_files=len(files)) as progress:
+        def sync_one(item):
+            name, record = item; path = tree_path(dest, name)
+            mode = record['mode']
+            try:
+                if not mode & statmod.S_IWUSR:
+                    os.chmod(path, mode | statmod.S_IWUSR)
+                with open(path, 'r+b') as f:
+                    os.fsync(f.fileno())
+            finally:
+                os.chmod(path, mode)
+            progress.update(count=1)
+            return name
+        for _ in bounded_results(sync_one, files):
+            pass
+    if manifest(src, label='核对原生复制后的源状态') != records:
+        raise SafeAbort('原生复制期间源目录发生变化，已停止。')
+    return engine
+
+
+def capability_report():
+    return dict(platform=platform_tag(), migration_supported=platform_tag() in ('windows', 'macos', 'linux'), python=sys.executable, default_workers=DEFAULT_IO_WORKERS,
+                copy_engines={'python': True, 'robocopy': shutil.which('robocopy') if os.name == 'nt' else None,
+                              'rsync': shutil.which('rsync') if os.name != 'nt' else None},
+                cleanup_engines=cleanup_choices(), display='自动检测终端；不支持动态面板时回退单行/纯文本')
+
+
+def cmd_capabilities(args):
+    print(json.dumps(capability_report(), ensure_ascii=False, indent=2), flush=True)
+
+
+def probe_copy_engine(engine):
+    global _ACTIVE, _COPY_RECEIPT, _COPY_ENGINE
+    selected, _ = resolve_copy_engine(engine)
+    if selected == 'python':
+        return '内置复制方式'
+    previous = _ACTIVE, _COPY_RECEIPT, _COPY_ENGINE
+    _ACTIVE, _COPY_RECEIPT, _COPY_ENGINE = None, None, engine
+    try:
+        with tempfile.TemporaryDirectory(prefix='wb-tool-probe-') as folder:
+            source, target = os.path.join(folder, '源 数据 ! &'), os.path.join(folder, '目标 数据 ! &')
+            os.makedirs(os.path.join(source, '空目录'))
+            with open(os.path.join(source, '中文.txt'), 'wb') as f:
+                f.write(b'WorkBuddy tool probe\n' * 500)
+            protected = os.path.join(source, 'readonly.txt')
+            with open(protected, 'wb') as f:
+                f.write(b'readonly fixture')
+            os.chmod(protected, 0o444)
+            if os.name == 'nt':
+                external = os.path.join(folder, 'external'); os.mkdir(external)
+                make_link(external, os.path.join(source, 'junction'))
+            else:
+                os.symlink('中文.txt', os.path.join(source, 'link'))
+            run_copy(source, target)
+            if not verify_strict(source, target):
+                raise UnsupportedEnvironment('原生复制工具临时样本验证未通过；可选择 python。')
+            for fixture in (source, target):
+                for parent, dirs, files in os.walk(fixture, topdown=True, followlinks=False):
+                    for name in list(dirs):
+                        path = os.path.join(parent, name)
+                        if link_target(path) is not None:
+                            remove_link(path); dirs.remove(name)
+                    for name in files:
+                        path = os.path.join(parent, name)
+                        if not os.path.islink(path):
+                            os.chmod(path, statmod.S_IRUSR | statmod.S_IWUSR)
+            return '已通过中文路径、只读文件、空目录、链接与 SHA-256 临时样本验证'
+    finally:
+        _ACTIVE, _COPY_RECEIPT, _COPY_ENGINE = previous
+
+
 def run_copy(src, dest, records=None):
     global _COPY_RECEIPT
     _COPY_RECEIPT = None
     """通用流式复制，四个平台采用相同计数与校验语义，无外部复制工具依赖。"""
     src, dest = native_path(src), native_path(dest)
     records = records if records is not None else manifest(src, label='[2/6] 扫描待复制数据')
+    engine, executable = resolve_copy_engine(_COPY_ENGINE)
+    if engine != 'python':
+        return native_copy(src, dest, records, engine, executable)
     total = sum(r.get('size', 0) for r in records.values())
     os.makedirs(dest, mode=0o700, exist_ok=True)
     # 调用方只传入本工具创建并记录的 staging；清理上次中断的多余副本条目。
@@ -1109,7 +1309,7 @@ def check_volume(dest, volume):
 def new_operation(action, src, dest, data, backup=None):
     global _ACTIVE
     op_id = uuid.uuid4().hex
-    plan = {'version': 2, 'id': op_id, 'action': action, 'method': action,
+    plan = {'execution': dict(copy_engine=_COPY_ENGINE, cleanup=_CLEANUP_ENGINE, workers=_IO_WORKERS, display=_DISPLAY), 'version': 2, 'id': op_id, 'action': action, 'method': action,
             'created_at': now_iso(), 'platform': platform_tag(), 'src': src, 'dest': dest,
             'data': data, 'backup': backup or src + BACKUP_SUFFIX + '-' + op_id,
             'staging': dest + '.wb-partial-' + op_id if action == 'migrate' else src + '.wb-restore-' + op_id,
@@ -1237,7 +1437,7 @@ def cmd_migrate(args):
         print('[4/6] 原路径已切换到新数据位置。', flush=True)
         transition(plan, 'cleanup')
         obsolete = data if old_target else plan['backup']
-        if not args.keep_backup:
+        if not args.keep_backup and _CLEANUP_ENGINE != 'keep':
             try:
                 assert_offline(manage)
                 with Progress('[5/6] 清理旧副本'):
@@ -1326,11 +1526,14 @@ def restore_data(args, full):
         transition(plan, 'cleanup')
         try:
             assert_offline()
-            with Progress('[5/6] 清理旧位置副本'):
-                print(trash_path(dest), flush=True)
+            if _CLEANUP_ENGINE == 'keep':
+                print('已选择保留旧位置副本: ' + dest, flush=True)
+            else:
+                with Progress('[5/6] 清理旧位置副本'):
+                    print(trash_path(dest), flush=True)
         except Exception as ex:
             warn('数据已恢复，旧位置副本清理失败，保留在 %s: %s' % (dest, ex))
-        if full and not getattr(args, 'keep_backup', False):
+        if full and not getattr(args, 'keep_backup', False) and _CLEANUP_ENGINE != 'keep':
             # 历次二次搬迁可能保留多个旧副本，只清理该源路径的可核实快照。
             snapshots = {old['backup']: old.get('source_digest')}
             for filename in sorted(glob.glob(os.path.join(PLAN_DIR, 'plan-*.json'))):
@@ -1466,7 +1669,7 @@ def cmd_cleanup_backup(args):
             print(trash_path(obsolete, hard=args.hard_delete), flush=True)
     else:
         print('旧副本已不存在。', flush=True)
-    plan.update(backup_removed=True, obsolete_removed=True)
+    plan.update(backup_removed=_CLEANUP_ENGINE != 'keep', obsolete_removed=_CLEANUP_ENGINE != 'keep')
     save_plan(plan)
 
 
@@ -1516,42 +1719,137 @@ def fit_line(text):
     return ''.join(out) + '...'
 
 
+def fmt_duration(seconds):
+    seconds = max(0, int(seconds))
+    hours, seconds = divmod(seconds, 3600)
+    minutes, seconds = divmod(seconds, 60)
+    return '%02d:%02d:%02d' % (hours, minutes, seconds) if hours else '%02d:%02d' % (minutes, seconds)
+
+
+def clipped(text, limit):
+    if cell_width(text) <= limit:
+        return text
+    out, width = [], 0
+    for char in text:
+        amount = cell_width(char)
+        if width + amount > max(0, limit - 3):
+            break
+        out.append(char); width += amount
+    return ''.join(out) + '...'
+
+
+def progress_panel(label, elapsed, count, size, total_files, total_bytes, fraction, speed, eta, final, failed):
+    width = max(12, shutil.get_terminal_size((100, 24)).columns - 2)
+    status = ('已停止' if failed else '完成') if final else '进行中'
+    suffix = '  %s  已用时 %s' % (status, fmt_duration(elapsed))
+    title = clipped(label, max(8, width - cell_width(suffix))) + suffix
+    if fraction is None:
+        spinner = ('·', '··', '···')[int(elapsed) % 3] if not final else ''
+        bar = '  处理中 %s' % spinner
+        amount = '已读取 ' + fmt_bytes(size) if size else '等待完成' if not count else format(count, ',') + ' 项'
+    else:
+        bar_size = max(8, min(28, width - 30))
+        filled = min(bar_size, int(fraction * bar_size))
+        bar = '  [' + '━' * filled + '─' * (bar_size - filled) + ']  %5.1f%%' % (fraction * 100)
+        amount = '%s / %s' % (fmt_bytes(size), fmt_bytes(total_bytes))
+    detail = []
+    if total_files is not None:
+        detail.append('%s / %s 项' % (format(count, ','), format(total_files, ',')))
+    elif count:
+        detail.append(format(count, ',') + ' 项')
+    if total_bytes is not None and size and elapsed > 1:
+        detail.append(fmt_bytes(speed) + '/s' if speed else '等待磁盘')
+    if eta is not None:
+        detail.append('预计剩余 ' + fmt_duration(eta))
+    elif not detail:
+        detail.append('请勿重新打开 WorkBuddy')
+    lines = [title, bar + '  ' + amount, '  ' + '  ·  '.join(detail)]
+    return [clipped(line, width) for line in lines]
+
+
+def compact_progress(label, elapsed, fraction, size, total_bytes, speed):
+    # 窄窗口优先保留阶段、百分比和耗时。
+    text = label + ('  %.1f%%' % (fraction * 100) if fraction is not None else '') + '  已用时 ' + fmt_duration(elapsed)
+    if total_bytes is not None:
+        text += '  ' + fmt_bytes(size) + '/' + fmt_bytes(total_bytes)
+    if speed and elapsed > 1:
+        text += '  ' + fmt_bytes(speed) + '/s'
+    return fit_line(text)
+
+
+def enable_terminal(console):
+    if not console.isatty() or os.environ.get('TERM') == 'dumb':
+        return False
+    if not NATIVE_WINDOWS:
+        return True
+    try:
+        import ctypes
+        import msvcrt
+        kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+        handle = msvcrt.get_osfhandle(console.fileno())
+        mode = ctypes.c_uint32()
+        kernel.GetConsoleMode.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)]
+        kernel.SetConsoleMode.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        return bool(kernel.GetConsoleMode(handle, ctypes.byref(mode)) and kernel.SetConsoleMode(handle, mode.value | 0x0004))
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
 class _LogStream:
     def __init__(self, console, log, mutex):
         self.console, self.log, self.mutex = console, log, mutex
         self.progress_width = 0
         self.progress_visible = False
         self.normal_line_open = False
+        self.ansi = enable_terminal(console)
+        self.progress_rows = 0
+
+    def clear_progress(self):
+        if self.progress_rows:
+            self.console.write('\x1b[%dA\r\x1b[J' % self.progress_rows)
+        elif self.progress_visible:
+            self.console.write('\r' + ' ' * self.progress_width + '\r')
+        self.progress_rows = 0; self.progress_visible = False; self.progress_width = 0
 
     def write(self, text):
         with self.mutex:
-            self.log.write(text)
-            self.log.flush()
-            if self.progress_visible:
-                self.console.write('\r' + ' ' * self.progress_width + '\r')
-                self.progress_visible = False
-                self.progress_width = 0
-            result = self.console.write(text)
-            self.console.flush()
+            self.log.write(text); self.log.flush()
+            self.clear_progress()
+            result = self.console.write(text); self.console.flush()
             if text:
                 self.normal_line_open = not text.endswith('\n')
             return result
 
-    def progress(self, text, final=False, force=False):
+    def progress(self, text, final=False, force=False, lines=None, failed=False):
         with self.mutex:
-            # 日志保留每次采样，终端只更新当前行；控制字符不进入日志。
-            self.log.write(text + '\n')
-            self.log.flush()
-            if self.console.isatty():
-                if self.normal_line_open and not final:
-                    return
-                line = fit_line(text)
-                width = cell_width(line)
-                self.console.write('\r' + line + ' ' * max(0, self.progress_width - width))
-                if final:
-                    self.console.write('\n')
-                self.progress_width = 0 if final else width
+            self.log.write(text + '\n'); self.log.flush()
+            tty = self.console.isatty() and _DISPLAY != 'plain'
+            if tty and self.normal_line_open:
+                return
+            if tty and lines is not None and self.ansi and _DISPLAY == 'auto':
+                self.clear_progress()
+                palette = ['31' if failed else '32' if final else '36', '32', '90']
+                color = 'NO_COLOR' not in os.environ
+                for index, line in enumerate(lines):
+                    line = fit_line(line)
+                    if color:
+                        line = '\x1b[%sm%s\x1b[0m' % (palette[index % len(palette)], line)
+                    self.console.write(line + '\n')
+                self.progress_rows = 0 if final else len(lines)
                 self.progress_visible = not final
+            elif tty:
+                if lines:
+                    # compact/传统控制台只刷新一行；摘要优先保留耗时与百分比。
+                    fields = text.split(' | ')
+                    line = '  '.join(fields[:3])
+                    if len(fields) > 3:
+                        line += '  ' + fields[3]
+                    line = fit_line(line)
+                else:
+                    line = fit_line(text)
+                width = cell_width(line)
+                self.console.write('\r' + line + ' ' * max(0, self.progress_width - width) + ('\n' if final else ''))
+                self.progress_width = 0 if final else width; self.progress_visible = not final
             elif final or force:
                 self.console.write(text + '\n')
             self.console.flush()
@@ -1631,7 +1929,9 @@ def cmd_run_job(args):
         with open(args.args_file, encoding='utf-8') as f:
             job = json.load(f)
         command = job.get('command', 'migrate')
-        common = dict(no_relaunch=False, force_any_dir=False, workers=worker_count(job.get('workers', DEFAULT_IO_WORKERS)))
+        common = dict(no_relaunch=False, force_any_dir=False, workers=worker_count(job.get('workers', DEFAULT_IO_WORKERS)),
+                      copy_engine=job.get('copy_engine', 'auto'), cleanup=job.get('cleanup', 'auto'), display=job.get('display', 'auto'), copy_tool=job.get('copy_tool'))
+        print('执行方案: 复制=%s / 清理=%s / 并发=%d' % (common['copy_engine'], common['cleanup'], common['workers']), flush=True)
         if command == 'migrate':
             if not job.get('dest_base'):
                 raise ValueError('Job is missing dest_base')
@@ -1736,6 +2036,7 @@ def posix_runner_content(job_name, python_executable=None):
 def cmd_make_runner(args):
     command = args.command
     python_executable = resolve_runner_python(getattr(args, 'python_executable', None))
+    probe_result = probe_copy_engine(_COPY_ENGINE)
     if command == 'migrate':
         if not args.dest_base:
             raise SafeAbort('需要 --dest-base。')
@@ -1749,6 +2050,7 @@ def cmd_make_runner(args):
         job_name = 'runner-%s-args.json' % command
     payload['keep_backup'] = getattr(args, 'keep_backup', False)
     payload['python_executable'] = python_executable
+    payload.update(copy_engine=_COPY_ENGINE, copy_tool=resolve_copy_engine(_COPY_ENGINE)[1], cleanup=_CLEANUP_ENGINE, display=_DISPLAY, capability_report=capability_report(), copy_probe=probe_result)
     payload['workers'] = worker_count(getattr(args, 'workers', DEFAULT_IO_WORKERS))
     suffix = '.bat' if os.name == 'nt' else ('.command' if sys.platform == 'darwin' else '.sh')
     out = os.path.abspath(os.path.expanduser(args.out or os.path.join(PLAN_DIR, 'run_' + command + suffix)))
@@ -1763,16 +2065,25 @@ def cmd_make_runner(args):
         f.write(content)
     if os.name != 'nt':
         os.chmod(out, 0o755)
+    print('已核对执行方案: 复制=%s / 清理=%s / 并发=%d；%s' % (_COPY_ENGINE, _CLEANUP_ENGINE, _IO_WORKERS, probe_result), flush=True)
     print('已生成: ' + out, flush=True)
     print('唯一启动入口: %s\n已验证的解释器: %s' % (out, python_executable), flush=True)
     print('Windows/macOS 可双击；Linux 在终端执行 sh "脚本路径"。日志、阶段与退出码统一。', flush=True)
     print('更新 Skill 后必须重新生成启动脚本。独立系统 Python 必須位于数据目录之外。', flush=True)
 
 
+def add_strategy_arguments(parser):
+    parser.add_argument('--copy-engine', choices=['auto', 'python', 'robocopy', 'rsync'], default='auto')
+    parser.add_argument('--copy-tool', help='原生复制工具的绝对路径；生成时验证，执行时绑定')
+    parser.add_argument('--cleanup', choices=['auto', 'keep', 'shell', 'trash', 'finder', 'gio', 'trash-put'], default='auto')
+    parser.add_argument('--display', choices=['auto', 'compact', 'plain'], default='auto')
+
+
 def main():
     _utf8_guard()
     p = argparse.ArgumentParser(description='WorkBuddy 数据迁移：内容校验、阶段记录、独占锁与恢复。')
     sub = p.add_subparsers(dest='cmd', required=True)
+    sub.add_parser('capabilities', help='只读输出本机工具与策略能力').set_defaults(func=cmd_capabilities)
     for name in ('detect', 'status'):
         parser = sub.add_parser(name)
         parser.add_argument('--src')
@@ -1787,6 +2098,7 @@ def main():
     mg.add_argument('--no-relaunch', action='store_true')
     mg.add_argument('--keep-backup', action='store_true')
     mg.add_argument('--workers', type=int, choices=range(1, 9), default=DEFAULT_IO_WORKERS)
+    add_strategy_arguments(mg)
     mg.set_defaults(func=cmd_migrate)
     runner = sub.add_parser('make-runner')
     runner.add_argument('--command', choices=['migrate', 'restore', 'rollback', 'recover'], default='migrate')
@@ -1797,6 +2109,7 @@ def main():
     runner.add_argument('--python', dest='python_executable', help='指定数据目录之外的现有系统/便携 Python，生成唯一入口')
     runner.add_argument('--keep-backup', action='store_true')
     runner.add_argument('--workers', type=int, choices=range(1, 9), default=DEFAULT_IO_WORKERS, help='复制/校验并发数；机械盘建议从 1 开始')
+    add_strategy_arguments(runner)
     runner.set_defaults(func=cmd_make_runner)
     job = sub.add_parser('run-job')
     job.add_argument('--args-file', required=True)
@@ -1811,8 +2124,12 @@ def main():
         parser.add_argument('--hard-delete', action='store_true')
         parser.add_argument('--yes', action='store_true')
         parser.add_argument('--workers', type=int, choices=range(1, 9), default=DEFAULT_IO_WORKERS)
+        add_strategy_arguments(parser)
         parser.set_defaults(func=func)
     args = p.parse_args()
+    if args.cmd == 'capabilities':
+        args.func(args)
+        return
     if args.cmd == 'run-job':
         args.func(args)
     else:
