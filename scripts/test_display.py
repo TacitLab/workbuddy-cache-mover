@@ -48,6 +48,11 @@ class DisplayTests(unittest.TestCase):
             self.assertTrue(all(m.cell_width(line)<=38 for line in lines))
             unknown=m.progress_panel('扫描目录',10,40,0,None,None,None,0,None,False,False)
         self.assertNotIn('%',''.join(unknown));self.assertNotIn('预计剩余',''.join(unknown))
+    def test_completed_wait_does_not_keep_showing_waiting(self):
+        lines=m.progress_panel('退出应用',15,0,0,None,None,None,0,None,True,False)
+        self.assertNotIn('等待完成',''.join(lines));self.assertNotIn('正在处理',''.join(lines))
+        self.assertIn('本阶段已完成',''.join(lines))
+
     def test_exception_marks_progress_stopped(self):
         output=io.StringIO()
         with contextlib.redirect_stdout(output):

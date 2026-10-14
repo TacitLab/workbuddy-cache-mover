@@ -1745,8 +1745,8 @@ def progress_panel(label, elapsed, count, size, total_files, total_bytes, fracti
     title = clipped(label, max(8, width - cell_width(suffix))) + suffix
     if fraction is None:
         spinner = ('·', '··', '···')[int(elapsed) % 3] if not final else ''
-        bar = '  处理中 %s' % spinner
-        amount = '已读取 ' + fmt_bytes(size) if size else '等待完成' if not count else format(count, ',') + ' 项'
+        bar = ('  操作已停止' if failed else '  本阶段已完成') if final else '  正在处理 %s' % spinner
+        amount = '已读取 ' + fmt_bytes(size) if size else ''
     else:
         bar_size = max(8, min(28, width - 30))
         filled = min(bar_size, int(fraction * bar_size))
@@ -1762,7 +1762,7 @@ def progress_panel(label, elapsed, count, size, total_files, total_bytes, fracti
     if eta is not None:
         detail.append('预计剩余 ' + fmt_duration(eta))
     elif not detail:
-        detail.append('请勿重新打开 WorkBuddy')
+        detail.append('详情见后续结果' if final else '请勿重新打开 WorkBuddy')
     lines = [title, bar + '  ' + amount, '  ' + '  ·  '.join(detail)]
     return [clipped(line, width) for line in lines]
 
