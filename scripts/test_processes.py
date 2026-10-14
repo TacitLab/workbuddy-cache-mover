@@ -48,6 +48,10 @@ class ProcessTests(unittest.TestCase):
         with mock.patch.object(m, 'process_snapshot', return_value={'11': process(11, 1, 'workbuddy', started='')}):
             self.assertEqual(m.detect_app_running()[0], 'unknown')
 
+    def test_engine_with_unknown_executable_fails_closed(self):
+        with mock.patch.object(m, 'process_snapshot', return_value={'11': process(11, 1, 'CodeBuddy.exe')}):
+            self.assertEqual(m.detect_app_running()[0], 'unknown')
+
     def test_current_runner_in_app_tree_is_never_killed(self):
         procs = [(str(os.getpid()), 'python')]
         with mock.patch.object(m, 'detect_app_running', return_value=('running', procs)), mock.patch.object(m.os, 'kill') as kill:

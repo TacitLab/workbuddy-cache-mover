@@ -292,7 +292,7 @@ def windows_path(path):
         tail = path[4:]
         if not (tail.startswith('UNC\\') or (len(tail) >= 3 and tail[0].isalpha() and tail[1:3] == ':\\')):
             raise SafeAbort('不支持设备命名空间作为迁移目录。')
-        return ntpath.normpath(path)
+        return path[:4] + ntpath.normpath(tail)
     if path.startswith('\\\\.\\'):
         raise SafeAbort('不支持设备路径作为迁移目录。')
     path = ntpath.abspath(path)
@@ -537,6 +537,11 @@ def tree_stats(path):
     return sum(r.get('size', 0) for r in data.values()), sum(r['kind'] != 'dir' for r in data.values()), 0
 
 
+def tree_path(root, relative):
+    # manifest 的 '.' 表示目录本身；Win32 扩展路径不接受尾随的 \ . 组件。
+    return root if relative == '.' else os.path.join(root, relative)
+
+
 def run_copy(src, dest):
     """通用流式复制，四个平台采用相同计数与校验语义，无外部复制工具依赖。"""
     src, dest = native_path(src), native_path(dest)
@@ -547,10 +552,10 @@ def run_copy(src, dest):
     previous = manifest(dest, label='检查临时副本')
     for rel, record in sorted(previous.items(), key=lambda item: item[0].count(os.sep)):
         if record['kind'] == 'dir':
-            path = os.path.normpath(os.path.join(dest, rel))
+            path = tree_path(dest, rel)
             os.chmod(path, record['mode'] | statmod.S_IRUSR | statmod.S_IWUSR | statmod.S_IXUSR)
     for rel in sorted(set(previous) - set(records), key=lambda p: p.count(os.sep), reverse=True):
-        path = os.path.normpath(os.path.join(dest, rel))
+        path = tree_path(dest, rel)
         if previous[rel]['kind'] in ('link', 'junction'):
             remove_link(path)
         elif previous[rel]['kind'] == 'dir':
@@ -559,7 +564,7 @@ def run_copy(src, dest):
             os.unlink(path)
     with Progress('[2/6] 正在复制', total, len(records)) as progress:
         for rel, record in sorted(records.items(), key=lambda item: (item[0].count(os.sep), item[0])):
-            s, d = os.path.normpath(os.path.join(src, rel)), os.path.normpath(os.path.join(dest, rel))
+            s, d = tree_path(src, rel), tree_path(dest, rel)
             os.makedirs(os.path.dirname(d), mode=0o700, exist_ok=True)
             kind = record['kind']
             if kind == 'dir':
@@ -601,7 +606,7 @@ def run_copy(src, dest):
             progress.update(count=1)
         for rel, record in sorted(records.items(), key=lambda item: -1 if item[0] == '.' else item[0].count(os.sep), reverse=True):
             if record['kind'] == 'dir':
-                shutil.copystat(os.path.normpath(os.path.join(src, rel)), os.path.normpath(os.path.join(dest, rel)), follow_symlinks=False)
+                shutil.copystat(tree_path(src, rel), tree_path(dest, rel), follow_symlinks=False)
     return 'python-stream'
 
 
@@ -756,7 +761,7 @@ def process_identity(record):
 
 def owns_app_process(record):
     name = record['name'].lower()
-    if name in ('workbuddy', 'workbuddy.exe') or name.startswith('workbuddy helper'):
+    if name in ('workbuddy', 'workbuddy.exe', 'workbuddytray.exe', 'workbuddy-tray.exe') or name.startswith('workbuddy helper'):
         return True
     path = record['path'].replace('\\', '/').lower()
     # 独立运行的 CodeBuddy 不属于本工具；仅确认 WorkBuddy 安装目录中的引擎。
@@ -787,6 +792,10 @@ def detect_app_running():
                             continue
                     owned.add(pid)
                     changed = True
+        for pid, record in records.items():
+            if pid not in owned and record['name'].lower() in ('codebuddy', 'codebuddy.exe', 'electron', 'electron.exe'):
+                if not record['path'] or not (ntpath.isabs(record['path']) if os.name == 'nt' else os.path.isabs(record['path'])):
+                    raise SafeAbort('无法核对后台引擎的可执行路径，不能确认 WorkBuddy 已退出。')
         if any(not records[pid]['started'] for pid in owned):
             raise SafeAbort('无法核对 WorkBuddy 进程启动身份。')
         _PROCESS_RECORDS = {pid: records[pid] for pid in owned}

@@ -29,6 +29,7 @@ class UsabilityTests(unittest.TestCase):
             self.assertEqual(m.windows_path(plain), expected)
             self.assertEqual(m.windows_path(expected), expected)
             self.assertEqual(m.display_path(expected), plain)
+            self.assertEqual(m.windows_path(expected + '\\.'), expected)
         with self.assertRaises(m.SafeAbort):
             m.windows_path('\\\\?\\GLOBALROOT\\Device\\Harddisk0')
 
