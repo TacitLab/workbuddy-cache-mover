@@ -34,7 +34,8 @@ BACKUP_SUFFIX = ".wb-migration-backup"
 WIN_SYMLINK_HINT = "目标需支持目录链接；Windows 本地卷使用 junction，UNC 需 symlink 权限。"
 _ACTIVE = None
 _WARNINGS = []
-_IO_WORKERS = 4
+DEFAULT_IO_WORKERS = 4 if sys.platform == 'win32' else 1
+_IO_WORKERS = DEFAULT_IO_WORKERS
 _COPY_RECEIPT = None
 NATIVE_WINDOWS = sys.platform == 'win32'
 FORCE_SIGNAL = getattr(signal, 'SIGKILL', 9)
@@ -509,7 +510,7 @@ def locked(func):
         require_supported()
         global _IO_WORKERS
         previous = _IO_WORKERS
-        _IO_WORKERS = worker_count(getattr(args, 'workers', 4))
+        _IO_WORKERS = worker_count(getattr(args, 'workers', DEFAULT_IO_WORKERS))
         try:
             with operation_lock():
                 return func(args)
@@ -598,6 +599,10 @@ def worker_count(value):
 def bounded_results(function, items, workers=None):
     """任务队列最多 2×并发数；异常时停止提交，等待在途写入退出。"""
     workers = worker_count(_IO_WORKERS if workers is None else workers)
+    if workers == 1:
+        for item in items:
+            yield function(item)
+        return
     iterator = iter(items)
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
         pending = collections.deque()
@@ -1626,7 +1631,7 @@ def cmd_run_job(args):
         with open(args.args_file, encoding='utf-8') as f:
             job = json.load(f)
         command = job.get('command', 'migrate')
-        common = dict(no_relaunch=False, force_any_dir=False, workers=worker_count(job.get('workers', 4)))
+        common = dict(no_relaunch=False, force_any_dir=False, workers=worker_count(job.get('workers', DEFAULT_IO_WORKERS)))
         if command == 'migrate':
             if not job.get('dest_base'):
                 raise ValueError('Job is missing dest_base')
@@ -1744,7 +1749,7 @@ def cmd_make_runner(args):
         job_name = 'runner-%s-args.json' % command
     payload['keep_backup'] = getattr(args, 'keep_backup', False)
     payload['python_executable'] = python_executable
-    payload['workers'] = worker_count(getattr(args, 'workers', 4))
+    payload['workers'] = worker_count(getattr(args, 'workers', DEFAULT_IO_WORKERS))
     suffix = '.bat' if os.name == 'nt' else ('.command' if sys.platform == 'darwin' else '.sh')
     out = os.path.abspath(os.path.expanduser(args.out or os.path.join(PLAN_DIR, 'run_' + command + suffix)))
     folder = os.path.dirname(out)
@@ -1781,7 +1786,7 @@ def main():
     mg.add_argument('--skip-app-handling', action='store_true', help='仅允许非默认测试目录')
     mg.add_argument('--no-relaunch', action='store_true')
     mg.add_argument('--keep-backup', action='store_true')
-    mg.add_argument('--workers', type=int, choices=range(1, 9), default=4)
+    mg.add_argument('--workers', type=int, choices=range(1, 9), default=DEFAULT_IO_WORKERS)
     mg.set_defaults(func=cmd_migrate)
     runner = sub.add_parser('make-runner')
     runner.add_argument('--command', choices=['migrate', 'restore', 'rollback', 'recover'], default='migrate')
@@ -1791,7 +1796,7 @@ def main():
     runner.add_argument('--out')
     runner.add_argument('--python', dest='python_executable', help='指定数据目录之外的现有系统/便携 Python，生成唯一入口')
     runner.add_argument('--keep-backup', action='store_true')
-    runner.add_argument('--workers', type=int, choices=range(1, 9), default=4, help='复制/校验并发数；机械盘建议从 1 开始')
+    runner.add_argument('--workers', type=int, choices=range(1, 9), default=DEFAULT_IO_WORKERS, help='复制/校验并发数；机械盘建议从 1 开始')
     runner.set_defaults(func=cmd_make_runner)
     job = sub.add_parser('run-job')
     job.add_argument('--args-file', required=True)
@@ -1805,7 +1810,7 @@ def main():
         parser.add_argument('--keep-backup', action='store_true')
         parser.add_argument('--hard-delete', action='store_true')
         parser.add_argument('--yes', action='store_true')
-        parser.add_argument('--workers', type=int, choices=range(1, 9), default=4)
+        parser.add_argument('--workers', type=int, choices=range(1, 9), default=DEFAULT_IO_WORKERS)
         parser.set_defaults(func=func)
     args = p.parse_args()
     if args.cmd == 'run-job':
