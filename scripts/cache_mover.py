@@ -203,8 +203,9 @@ def windows_recycle(path):
     sink.table = table
     try:
         checked(ole.CoCreateInstance(c.byref(clsid), None, 1, c.byref(iid_operation), c.byref(operation)), '创建回收站接口')
-        # RECYCLEONDELETE + ADDUNDORECORD + EARLYFAILURE + NOERRORUI + NOCONFIRMATION + SILENT。
-        checked(call(operation, 5, [UINT], 0x20180414), '设置仅回收模式')
+        # 回收整个目录对象，不递归处理其子条目，避免长子路径触发永久删除降级。
+        # RECYCLEONDELETE + ADDUNDORECORD + EARLYFAILURE + NOERRORUI + NORECURSION + NOCONFIRMATION + SILENT。
+        checked(call(operation, 5, [UINT], 0x20181414), '设置仅回收模式')
         checked(shell.SHCreateItemFromParsingName(path, None, c.byref(iid_item), c.byref(item)), '读取旧副本目录')
         checked(call(operation, 18, [PTR, PTR], item, c.byref(sink)), '提交回收操作')
         performed = call(operation, 21, [])
