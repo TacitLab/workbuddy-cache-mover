@@ -613,7 +613,7 @@ def bounded_results(function, items, workers=None):
 def file_hash(path, record, progress):
     digest = hashlib.sha256()
     with open(path, 'rb') as f:
-        if signature(os.fstat(f.fileno())) != record['signature']:
+        if signature(os.fstat(f.fileno()))[:2] != record['signature'][:2]:
             raise SafeAbort('读取前文件发生变化: ' + display_path(path))
         while True:
             chunk = f.read(1024 * 1024)
@@ -621,7 +621,7 @@ def file_hash(path, record, progress):
                 break
             digest.update(chunk)
             progress.update(size=len(chunk))
-        if signature(os.fstat(f.fileno())) != record['signature']:
+        if signature(os.fstat(f.fileno()))[:2] != record['signature'][:2]:
             raise SafeAbort('读取期间文件发生变化: ' + display_path(path))
     if signature(os.lstat(path)) != record['signature']:
         raise SafeAbort('读取后文件发生变化: ' + display_path(path))
@@ -641,7 +641,8 @@ def manifest(path, hashes=False, label='扫描目录'):
                 entries = sorted(iterator, key=lambda e: e.name)
             for entry in entries:
                 rel = os.path.relpath(entry.path, path)
-                st = entry.stat(follow_symlinks=False)
+                # Windows 不同 Python 版本的目录枚举与句柄 stat 对 ctime 的语义不同。
+                st = os.lstat(entry.path) if NATIVE_WINDOWS else entry.stat(follow_symlinks=False)
                 if statmod.S_ISLNK(st.st_mode):
                     record = {'kind': 'link', 'target': os.readlink(entry.path),
                               'directory': bool(getattr(st, 'st_file_attributes', 0) & 0x10) if os.name == 'nt' else False}
@@ -749,7 +750,7 @@ def run_copy(src, dest, records=None):
             digest = hashlib.sha256()
             try:
                 with open(s, 'rb') as source, open(temporary, 'xb') as target:
-                    if signature(os.fstat(source.fileno())) != record['signature']:
+                    if signature(os.fstat(source.fileno()))[:2] != record['signature'][:2]:
                         raise SafeAbort('复制前源文件发生变化: ' + display_path(s))
                     while True:
                         chunk = source.read(1024 * 1024)
@@ -760,7 +761,7 @@ def run_copy(src, dest, records=None):
                         progress.update(size=len(chunk))
                     target.flush()
                     os.fsync(target.fileno())
-                    if signature(os.fstat(source.fileno())) != record['signature']:
+                    if signature(os.fstat(source.fileno()))[:2] != record['signature'][:2]:
                         raise SafeAbort('复制期间源文件发生变化: ' + display_path(s))
                 if signature(os.lstat(s)) != record['signature']:
                     raise SafeAbort('复制后源文件发生变化: ' + display_path(s))
