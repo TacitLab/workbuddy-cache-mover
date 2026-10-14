@@ -98,7 +98,10 @@ class PermissionTests(unittest.TestCase):
         self.assertEqual(recycle.call_count, 2)
         self.assertEqual(set(self.api.repaired), {self.day, self.file})
         self.assertEqual(struct.unpack_from('<I', m.acl_entries(self.api.rules[self.file])[1][0], 4)[0], 2)
-        with open(self.plan['permission_reports'][0], encoding='utf-8') as f: self.assertEqual(json.load(f)['status'], 'recycled')
+        with open(self.plan['permission_reports'][0], encoding='utf-8') as f: report = json.load(f)
+        self.assertEqual(report['status'], 'recycled')
+        with open(report['events_path'], encoding='utf-8') as f: events = [json.loads(line) for line in f]
+        self.assertEqual([e['event'] for e in events], ['applying', 'applied', 'applying', 'applied'])
     def test_pipe_and_off_modes_never_prompt_or_write(self):
         for mode in ('pipe', 'off'):
             with self.subTest(mode=mode), mock.patch.object(m, 'windows_recycle', side_effect=self.failure), mock.patch('builtins.input') as ask, mock.patch.object(m.sys, 'stdin', io.StringIO() if mode == 'pipe' else Terminal()), mock.patch.object(m, '_PERMISSION_REPAIR', 'off' if mode == 'off' else 'ask'):
@@ -130,6 +133,14 @@ class PermissionTests(unittest.TestCase):
         with mock.patch.object(m, 'windows_recycle', side_effect=[self.failure, self.failure]) as recycle, mock.patch('builtins.input', return_value='REPAIR') as ask:
             with self.assertRaises(OSError): m.recycle_with_permissions(self.backup)
         self.assertEqual(recycle.call_count, 2); self.assertEqual(ask.call_count, 1)
+    def test_successful_recycle_is_not_reported_as_retained_if_final_log_write_fails(self):
+        real_json = m.atomic_json
+        def write(path, report):
+            if report.get('status') == 'recycled': raise OSError('disk full after recycling')
+            return real_json(path, report)
+        with mock.patch.object(m, 'windows_recycle', side_effect=[self.failure, 'test recycled']), mock.patch('builtins.input', return_value='REPAIR'), mock.patch.object(m, 'atomic_json', side_effect=write), mock.patch.object(m, 'warn') as warning:
+            self.assertEqual(m.recycle_with_permissions(self.backup), 'test recycled')
+            warning.assert_called_once()
     def test_links_do_not_expand_the_modification_scope(self):
         link = os.path.join(self.day, 'external-link'); m.make_link(self.dest, link)
         try:

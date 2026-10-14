@@ -558,6 +558,7 @@ def recycle_with_permissions(path):
                           status='awaiting_authorization', failure=str(failure))
             report_path = os.path.join(PLAN_DIR, 'cleanup-permissions-%s-%s.json' %
                                        (_ACTIVE['id'], uuid.uuid4().hex))
+            report['events_path'] = report_path[:-5] + '-events.jsonl'
             atomic_json(report_path, report)
             _ACTIVE.setdefault('permission_reports', []).append(report_path)
             save_plan(_ACTIVE)
@@ -569,17 +570,28 @@ def recycle_with_permissions(path):
             permission_scope(path)
             if api.read(path) != root_before:
                 raise OSError('旧副本根目录身份或权限在确认后发生变化。')
-            for change in changes:
-                permission_scope(path)
-                guarded_permission_path(path, change['path'])
-                api.repair(change['path'], change['before'])
-                report['applied'].append(change['path'])
-                atomic_json(report_path, report)
+            with open(report['events_path'], 'x', encoding='utf-8') as events:
+                def event(kind, path):
+                    events.write(json.dumps(dict(event=kind, path=path, at=now_iso()), ensure_ascii=False) + '\n')
+                    events.flush(); os.fsync(events.fileno())
+                for change in changes:
+                    permission_scope(path)
+                    if api.read(path)['identity'] != root_before['identity']:
+                        raise OSError('旧副本根目录被替换，停止修改权限。')
+                    guarded_permission_path(path, change['path'])
+                    event('applying', change['path'])
+                    api.repair(change['path'], change['before'])
+                    report['applied'].append(change['path'])
+                    event('applied', change['path'])
             report['status'] = 'permissions_repaired'; atomic_json(report_path, report)
             print('已解除 %d 个旧副本对象的删除限制，正在重试回收 ...' % len(changes), flush=True)
             permission_scope(path)
             result = windows_recycle(path)  # 不递归进入授权流程，不重试其他删除方式。
-            report['status'] = 'recycled'; atomic_json(report_path, report)
+            report['status'] = 'recycled'
+            try:
+                atomic_json(report_path, report)
+            except OSError as ex:
+                warn('旧副本已移入回收站，但权限记录最终状态写入失败: %s (%s)' % (report_path, ex))
             return result
         except Exception as ex:
             if report and report_path and report.get('status') != 'kept_without_authorization':
@@ -589,7 +601,10 @@ def recycle_with_permissions(path):
                 except OSError:
                     pass  # 既有原权限/已应用记录保留；完整异常另存运行日志。
             # 原始回收错误不能被诊断失败掩盖；权限修改失败也不触发永久删除。
-            raise OSError('%s\n权限检查/处理: %s' % (failure, ex)) from ex
+            detail = str(ex)
+            if report and report.get('authorized_at'):
+                detail += '；权限修改可能已部分应用，未自动撤销，请核对原权限与逐条处理记录: ' + report_path
+            raise OSError('%s\n权限检查/处理: %s' % (failure, detail)) from ex
         finally:
             _PROMPTING.clear()
 
